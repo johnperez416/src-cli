@@ -25,9 +25,8 @@ require (
 	github.com/sourcegraph/sourcegraph/lib v0.0.0-20210520231824-520a2ae26af0
 	github.com/ssor/bom v0.0.0-20170718123548-6386211fdfcf // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb // indirect
-	golang.org/x/net v0.0.0-20201021035429-f5854403a974
-	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9
-	golang.org/x/sys v0.0.0-20210426080607-c94f62235c83 // indirect
+	golang.org/x/net v0.7.0
+	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
 	gopkg.in/yaml.v3 v3.0.0-20200615113413-eeeca48fe776
 	jaytaylor.com/html2text v0.0.0-20200412013138-3577fbdbcff7
 )
