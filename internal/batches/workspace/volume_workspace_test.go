@@ -1,20 +1,18 @@
 package workspace
 
 import (
-	"bytes"
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/pkg/errors"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 
-	"github.com/sourcegraph/src-cli/internal/batches"
+	batcheslib "github.com/sourcegraph/sourcegraph/lib/batches"
+
 	"github.com/sourcegraph/src-cli/internal/batches/docker"
-	"github.com/sourcegraph/src-cli/internal/batches/git"
 	"github.com/sourcegraph/src-cli/internal/batches/graphql"
 	"github.com/sourcegraph/src-cli/internal/batches/mock"
 	"github.com/sourcegraph/src-cli/internal/exec/expect"
@@ -28,7 +26,7 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 
 	// Create an empty file. It doesn't matter that it's an invalid zip, since
 	// we're mocking the unzip command anyway.
-	f, err := ioutil.TempFile(os.TempDir(), "volume-workspace-*")
+	f, err := os.CreateTemp(os.TempDir(), "volume-workspace-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,16 +56,11 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 		DefaultBranch: &graphql.Branch{Name: "main"},
 	}
 
-	stepWithImage := func(image docker.Image) batches.Step {
-		s := batches.Step{}
-		s.SetImage(image)
-		return s
-	}
-
 	for name, tc := range map[string]struct {
 		archive      *fakeRepoArchive
 		expectations []*expect.Expectation
-		steps        []batches.Step
+		steps        []batcheslib.Step
+		imageEnsurer imageEnsurer
 		wantErr      bool
 	}{
 		"no steps": {
@@ -104,7 +97,8 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					"sh", "/run.sh",
 				),
 			},
-			steps: []batches.Step{},
+			steps:        []batcheslib.Step{},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) { return nil, nil },
 		},
 		"one root:root step": {
 			expectations: []*expect.Expectation{
@@ -140,8 +134,11 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					"sh", "/run.sh",
 				),
 			},
-			steps: []batches.Step{
-				stepWithImage(&mock.Image{UidGid: docker.Root}),
+			steps: []batcheslib.Step{
+				{},
+			},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) {
+				return &mock.Image{UidGid: docker.Root}, nil
 			},
 		},
 		"one user:user step": {
@@ -178,8 +175,11 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					"sh", "/run.sh",
 				),
 			},
-			steps: []batches.Step{
-				stepWithImage(&mock.Image{UidGid: docker.UIDGID{UID: 1, GID: 2}}),
+			steps: []batcheslib.Step{
+				{},
+			},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) {
+				return &mock.Image{UidGid: docker.UIDGID{UID: 1, GID: 2}}, nil
 			},
 		},
 		"docker volume create failure": {
@@ -189,8 +189,11 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					"docker", "volume", "create",
 				),
 			},
-			steps: []batches.Step{
-				stepWithImage(&mock.Image{UidGid: docker.Root}),
+			steps: []batcheslib.Step{
+				{},
+			},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) {
+				return &mock.Image{UidGid: docker.Root}, nil
 			},
 			wantErr: true,
 		},
@@ -208,9 +211,16 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					DockerVolumeWorkspaceImage,
 					"sh", "-c", "touch /work/*; chown -R 0:0 /work",
 				),
+				expect.NewGlob(
+					expect.Behaviour{ExitCode: 0},
+					"docker", "volume", "rm", volumeID,
+				),
 			},
-			steps: []batches.Step{
-				stepWithImage(&mock.Image{UidGid: docker.Root}),
+			steps: []batcheslib.Step{
+				{},
+			},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) {
+				return &mock.Image{UidGid: docker.Root}, nil
 			},
 			wantErr: true,
 		},
@@ -247,9 +257,16 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					DockerVolumeWorkspaceImage,
 					"sh", "/run.sh",
 				),
+				expect.NewGlob(
+					expect.Behaviour{ExitCode: 0},
+					"docker", "volume", "rm", volumeID,
+				),
 			},
-			steps: []batches.Step{
-				stepWithImage(&mock.Image{UidGid: docker.Root}),
+			steps: []batcheslib.Step{
+				{},
+			},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) {
+				return &mock.Image{UidGid: docker.Root}, nil
 			},
 			wantErr: true,
 		},
@@ -277,9 +294,16 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					DockerVolumeWorkspaceImage,
 					"sh", "-c", "unzip /tmp/zip; rm /work/*",
 				),
+				expect.NewGlob(
+					expect.Behaviour{ExitCode: 0},
+					"docker", "volume", "rm", volumeID,
+				),
 			},
-			steps: []batches.Step{
-				stepWithImage(&mock.Image{UidGid: docker.Root}),
+			steps: []batcheslib.Step{
+				{},
+			},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) {
+				return &mock.Image{UidGid: docker.Root}, nil
 			},
 			wantErr: true,
 		},
@@ -329,8 +353,11 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 					"sh", "/run.sh",
 				),
 			},
-			steps: []batches.Step{
-				stepWithImage(&mock.Image{UidGid: docker.Root}),
+			steps: []batcheslib.Step{
+				{},
+			},
+			imageEnsurer: func(_ context.Context, _ string) (docker.Image, error) {
+				return &mock.Image{UidGid: docker.Root}, nil
 			},
 		},
 	} {
@@ -341,6 +368,7 @@ func TestVolumeWorkspaceCreator(t *testing.T) {
 				a = tc.archive
 			}
 
+			wc.EnsureImage = tc.imageEnsurer
 			w, err := wc.Create(ctx, repo, tc.steps, a)
 			if tc.wantErr {
 				if err == nil {
@@ -414,91 +442,6 @@ func TestVolumeWorkspace_WorkDir(t *testing.T) {
 	if have := (&dockerVolumeWorkspace{}).WorkDir(); have != nil {
 		t.Errorf("unexpected work dir: %q", *have)
 	}
-}
-
-// For the below tests that essentially delegate to runScript, we're not going
-// to test the content of the script file: we'll do that as a one off test at
-// the bottom of runScript itself, rather than depending on script content that
-// may drift over time.
-
-func TestVolumeWorkspace_Changes(t *testing.T) {
-	ctx := context.Background()
-	w := &dockerVolumeWorkspace{volume: volumeID}
-
-	t.Run("success", func(t *testing.T) {
-		for name, tc := range map[string]struct {
-			stdout string
-			want   *git.Changes
-		}{
-			"empty": {
-				stdout: "",
-				want:   &git.Changes{},
-			},
-			"valid": {
-				stdout: `
-M  go.mod
-M  internal/campaigns/volume_workspace.go
-M  internal/campaigns/volume_workspace_test.go				
-				`,
-				want: &git.Changes{Modified: []string{
-					"go.mod",
-					"internal/campaigns/volume_workspace.go",
-					"internal/campaigns/volume_workspace_test.go",
-				}},
-			},
-		} {
-			t.Run(name, func(t *testing.T) {
-				expect.Commands(
-					t,
-					expect.NewGlob(
-						expect.Behaviour{Stdout: bytes.TrimSpace([]byte(tc.stdout))},
-						"docker", "run", "--rm", "--init", "--workdir", "/work",
-						"--mount", "type=bind,source=*,target=/run.sh,ro",
-						"--user", "0:0",
-						"--mount", "type=volume,source="+volumeID+",target=/work",
-						DockerVolumeWorkspaceImage,
-						"sh", "/run.sh",
-					),
-				)
-
-				have, err := w.Changes(ctx)
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-
-				if diff := cmp.Diff(have, tc.want); diff != "" {
-					t.Errorf("unexpected changes (-have +want):\n\n%s", diff)
-				}
-
-			})
-		}
-	})
-
-	t.Run("failure", func(t *testing.T) {
-		for name, behaviour := range map[string]expect.Behaviour{
-			"exit code":        {ExitCode: 1},
-			"malformed status": {Stdout: []byte("Z")},
-		} {
-			t.Run(name, func(t *testing.T) {
-				expect.Commands(
-					t,
-					expect.NewGlob(
-						behaviour,
-						"docker", "run", "--rm", "--init", "--workdir", "/work",
-						"--mount", "type=bind,source=*,target=/run.sh,ro",
-						"--user", "0:0",
-						"--mount", "type=volume,source="+volumeID+",target=/work",
-						DockerVolumeWorkspaceImage,
-						"sh", "/run.sh",
-					),
-				)
-
-				if _, err := w.Changes(ctx); err == nil {
-					t.Error("unexpected nil error")
-				}
-			})
-		}
-	})
 }
 
 func TestVolumeWorkspace_Diff(t *testing.T) {
@@ -625,7 +568,7 @@ func TestVolumeWorkspace_runScript(t *testing.T) {
 				// mount options. Let's go get it!
 				values := strings.Split(arg[6], ",")
 				source := strings.SplitN(values[1], "=", 2)
-				have, err := ioutil.ReadFile(source[1])
+				have, err := os.ReadFile(source[1])
 				if err != nil {
 					return errors.Errorf("error reading temporary file %q: %v", source[1], err)
 				}

@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	goexec "os/exec"
 	"strings"
 	"sync"
 
-	"github.com/pkg/errors"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 
 	"github.com/sourcegraph/src-cli/internal/exec"
 )
@@ -39,9 +40,7 @@ type image struct {
 	// hard to prevent performing the same operations on the same image over and
 	// over, since some of them are expensive.
 
-	digest     string
-	digestErr  error
-	digestOnce sync.Once
+	digest string
 
 	ensureErr  error
 	ensureOnce sync.Once
@@ -51,52 +50,87 @@ type image struct {
 	uidGidOnce sync.Once
 }
 
-// Digest gets and returns the content digest for the image. Note that this is
-// different from the "distribution digest" (which is what you can use to
-// specify an image to `docker run`, as in `my/image@sha256:xxx`). We need to
-// use the content digest because the distribution digest is only computed for
-// images that have been pulled from or pushed to a registry. See
-// https://windsock.io/explaining-docker-image-ids/ under "A Final Twist" for a
-// good explanation.
+// Digest returns the content digest for the image. Note that this is different
+// from the "distribution digest" (which is what you can use to specify an image
+// to `docker run`, as in `my/image@sha256:xxx`). We need to use the content digest
+// because the distribution digest is only computed for images that have been pulled
+// from or pushed to a registry. See https://windsock.io/explaining-docker-image-ids/
+// under "A Final Twist" for a good explanation.
 func (image *image) Digest(ctx context.Context) (string, error) {
-	image.digestOnce.Do(func() {
-		image.digest, image.digestErr = func() (string, error) {
-			if err := image.Ensure(ctx); err != nil {
-				return "", err
-			}
-
-			// TODO!(sqs): is image id the right thing to use here? it is NOT
-			// the digest. but the digest is not calculated for all images
-			// (unless they are pulled/pushed from/to a registry), see
-			// https://github.com/moby/moby/issues/32016.
-			out, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", "--", image.name).CombinedOutput()
-			if err != nil {
-				return "", errors.Wrapf(err, "inspecting docker image: %s", string(bytes.TrimSpace(out)))
-			}
-			id := string(bytes.TrimSpace(out))
-			if id == "" {
-				return "", errors.Errorf("unexpected empty docker image content ID for %q", image.name)
-			}
-			return id, nil
-		}()
-	})
-
-	return image.digest, image.digestErr
+	ensureErr := image.Ensure(ctx)
+	return image.digest, ensureErr
 }
 
 // Ensure ensures that the image has been pulled by Docker. Note that it does
 // not attempt to pull a newer version of the image if it exists locally.
 func (image *image) Ensure(ctx context.Context) error {
 	image.ensureOnce.Do(func() {
-		image.ensureErr = func() error {
+		image.ensureErr = func() (err error) {
+			inspectDigest := func() (string, error) {
+				// Since we are only asking Docker for local information, we
+				// expect this operation to be quick, and therefore set a
+				// relatively low timeout for Docker to respond. This is
+				// particularly useful because this function is usually the
+				// first non-trivial interaction we have with Docker in a
+				// src-cli invocation, and this allows us to catch failure modes
+				// that result in the Docker socket still listening and
+				// accepting connections, but where dockerd is no longer able to
+				// respond to non-trivial requests.
+				//
+				// Anecdotally, this seems to happen most frequently with Docker
+				// Desktop VMs running out of memory, whereupon the Linux
+				// kernel's OOM killer sometimes chooses to kill components of
+				// Docker instead of processes within containers.
+				dctx, cancel, err := withFastCommandContext(ctx)
+				if err != nil {
+					return "", err
+				}
+				defer cancel()
+
+				args := []string{"image", "inspect", "--format", "{{ .Id }}", image.name}
+				out, err := exec.CommandContext(dctx, "docker", args...).Output()
+				id := string(bytes.TrimSpace(out))
+
+				if errors.IsDeadlineExceeded(err) || errors.IsDeadlineExceeded(dctx.Err()) {
+					return "", newFastCommandTimeoutError(dctx, args...)
+				} else if err != nil {
+					return "", err
+				}
+
+				return id, nil
+			}
+
 			// docker image inspect will return a non-zero exit code if the image and
 			// tag don't exist locally, regardless of the format.
-			if err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "1", image.name).Run(); err != nil {
+			var digest string
+			if digest, err = inspectDigest(); errors.HasType[*fastCommandTimeoutError](err) {
+				// Ensure we immediately propagate a timeout up, rather than
+				// trying to tell an unresponsive Docker to pull.
+				return err
+			} else if err != nil {
 				// Let's try pulling the image.
-				if err := exec.CommandContext(ctx, "docker", "image", "pull", image.name).Run(); err != nil {
+				pullCmd := exec.CommandContext(ctx, "docker", "image", "pull", image.name)
+				var stderr bytes.Buffer
+				pullCmd.Stderr = &stderr
+				if err := pullCmd.Run(); err != nil {
+					exitErr := &goexec.ExitError{}
+					if errors.As(err, &exitErr) {
+						return errors.Newf("failed to pull image: %s\ndocker pull exited with code %d", stderr.String(), exitErr.ExitCode())
+					}
 					return errors.Wrap(err, "pulling image")
 				}
+				// And try again to get the image digest.
+				digest, err = inspectDigest()
+				if err != nil {
+					return errors.Wrap(err, "not found after pulling image")
+				}
 			}
+
+			if digest == "" {
+				return errors.Errorf("unexpected empty docker image content ID for %q", image.name)
+			}
+
+			image.digest = digest
 
 			return nil
 		}()

@@ -3,11 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 
-	"github.com/pkg/errors"
+	"github.com/sourcegraph/src-cli/internal/cmderrors"
 	"github.com/sourcegraph/src-cli/internal/servegit"
 )
 
@@ -24,7 +24,7 @@ By default 'src serve-git' will recursively serve your current directory on the 
 'src serve-git -list' will not start up the server. Instead it will write to stdout a list of
 repository names it would serve.
 
-Documentation at https://docs.sourcegraph.com/admin/external_service/src_serve_git
+Documentation at https://sourcegraph.com/docs/admin/code_hosts/src_serve_git
 `)
 	}
 	var (
@@ -50,10 +50,10 @@ Documentation at https://docs.sourcegraph.com/admin/external_service/src_serve_g
 			repoDir = args[0]
 
 		default:
-			return &usageError{errors.New("requires zero or one arguments")}
+			return cmderrors.Usage("requires zero or one arguments")
 		}
 
-		dbug := log.New(ioutil.Discard, "", log.LstdFlags)
+		dbug := log.New(io.Discard, "", log.LstdFlags)
 		if *verbose {
 			dbug = log.New(os.Stderr, "DBUG serve-git: ", log.LstdFlags)
 		}

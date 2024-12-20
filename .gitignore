@@ -1,4 +1,17 @@
 ./src
+cmd/src/src
+*.zip
 release
 ./vendor
 .idea
+.env
+.envrc
+src-snapshot/
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-zoekt
+bazel-src-cli
+.DS_Store
+samples
+sourcegraph-sboms/

@@ -5,17 +5,17 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
-	"github.com/sourcegraph/src-cli/internal/batches"
-	"github.com/sourcegraph/src-cli/internal/batches/git"
+	batcheslib "github.com/sourcegraph/sourcegraph/lib/batches"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
+
 	"github.com/sourcegraph/src-cli/internal/batches/graphql"
+	"github.com/sourcegraph/src-cli/internal/batches/repozip"
+	"github.com/sourcegraph/src-cli/internal/batches/util"
 )
 
 type dockerBindWorkspaceCreator struct {
@@ -24,9 +24,7 @@ type dockerBindWorkspaceCreator struct {
 
 var _ Creator = &dockerBindWorkspaceCreator{}
 
-func (wc *dockerBindWorkspaceCreator) Type() CreatorType { return CreatorTypeBind }
-
-func (wc *dockerBindWorkspaceCreator) Create(ctx context.Context, repo *graphql.Repository, steps []batches.Step, archive batches.RepoZip) (Workspace, error) {
+func (wc *dockerBindWorkspaceCreator) Create(ctx context.Context, repo *graphql.Repository, steps []batcheslib.Step, archive repozip.Archive) (Workspace, error) {
 	w, err := wc.unzipToWorkspace(ctx, repo, archive.Path())
 	if err != nil {
 		return nil, errors.Wrap(err, "unzipping the repository")
@@ -56,7 +54,7 @@ func (*dockerBindWorkspaceCreator) prepareGitRepo(ctx context.Context, w *docker
 }
 
 func (wc *dockerBindWorkspaceCreator) unzipToWorkspace(ctx context.Context, repo *graphql.Repository, zip string) (*dockerBindWorkspace, error) {
-	prefix := "workspace-" + repo.Slug()
+	prefix := "workspace-" + util.SlugForRepo(repo.Name, repo.Rev())
 	workspace, err := unzipToTempDir(ctx, zip, wc.Dir, prefix)
 	if err != nil {
 		return nil, errors.Wrap(err, "unzipping the ZIP archive")
@@ -103,9 +101,15 @@ func (wc *dockerBindWorkspaceCreator) copyToWorkspace(ctx context.Context, w *do
 	return nil
 }
 
+// dockerBindWorkspace implements a workspace that operates on the host FS
+// and is mounted into the docker containers using a bind mount in the end.
 type dockerBindWorkspace struct {
+	// tempDir is a temporary directory that will be used for ephemeral files
+	// that are needed throughout the process.
 	tempDir string
-
+	// dir is the directory where the repo archive is unzipped to.
+	// This is also the path that is directly mounted into the docker
+	// containers.
 	dir string
 }
 
@@ -124,25 +128,11 @@ func (w *dockerBindWorkspace) DockerRunOpts(ctx context.Context, target string) 
 
 func (w *dockerBindWorkspace) WorkDir() *string { return &w.dir }
 
-func (w *dockerBindWorkspace) Changes(ctx context.Context) (*git.Changes, error) {
+func (w *dockerBindWorkspace) Diff(ctx context.Context) ([]byte, error) {
 	if _, err := runGitCmd(ctx, w.dir, "add", "--all"); err != nil {
 		return nil, errors.Wrap(err, "git add failed")
 	}
 
-	statusOut, err := runGitCmd(ctx, w.dir, "status", "--porcelain")
-	if err != nil {
-		return nil, errors.Wrap(err, "git status failed")
-	}
-
-	changes, err := git.ParseGitStatus(statusOut)
-	if err != nil {
-		return nil, errors.Wrap(err, "parsing git status output")
-	}
-
-	return &changes, nil
-}
-
-func (w *dockerBindWorkspace) Diff(ctx context.Context) ([]byte, error) {
 	// As of Sourcegraph 3.14 we only support unified diff format.
 	// That means we need to strip away the `a/` and `/b` prefixes with `--no-prefix`.
 	// See: https://github.com/sourcegraph/sourcegraph/blob/82d5e7e1562fef6be5c0b17f18631040fd330835/enterprise/internal/campaigns/service.go#L324-L329
@@ -156,7 +146,7 @@ func (w *dockerBindWorkspace) Diff(ctx context.Context) ([]byte, error) {
 
 func (w *dockerBindWorkspace) ApplyDiff(ctx context.Context, diff []byte) error {
 	// Write the diff to a temp file so we can pass it to `git apply`
-	tmp, err := ioutil.TempFile(w.tempDir, "bind-workspace-test-*")
+	tmp, err := os.CreateTemp(w.tempDir, "bind-workspace-test-*")
 	if err != nil {
 		return errors.Wrap(err, "saving cached diff to temporary file")
 	}
@@ -171,8 +161,8 @@ func (w *dockerBindWorkspace) ApplyDiff(ctx context.Context, diff []byte) error 
 	}
 
 	// Apply diff
-	if _, err = runGitCmd(ctx, w.dir, "apply", "-p0", tmp.Name()); err != nil {
-		return errors.Wrap(err, "applying cached diff")
+	if out, err := runGitCmd(ctx, w.dir, "apply", "-p0", tmp.Name()); err != nil {
+		return errors.Wrapf(err, "applying cached diff: %s", string(out))
 	}
 
 	// Add all files to index
@@ -180,19 +170,8 @@ func (w *dockerBindWorkspace) ApplyDiff(ctx context.Context, diff []byte) error 
 	return err
 }
 
-func fileExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
 func unzipToTempDir(ctx context.Context, zipFile, tempDir, tempFilePrefix string) (string, error) {
-	volumeDir, err := ioutil.TempDir(tempDir, tempFilePrefix)
+	volumeDir, err := os.MkdirTemp(tempDir, tempFilePrefix)
 	if err != nil {
 		return "", err
 	}
@@ -334,7 +313,7 @@ func mkdirAll(base, path string, perm os.FileMode) error {
 // ensureAll ensures that all directories under path have the expected
 // permissions.
 func ensureAll(base, path string, perm os.FileMode) error {
-	var errs *multierror.Error
+	var errs errors.MultiError
 
 	// In plain English: for each directory in the path parameter, we should
 	// chmod that path to the permissions that are expected.
@@ -342,9 +321,9 @@ func ensureAll(base, path string, perm os.FileMode) error {
 	for _, element := range strings.Split(path, string(os.PathSeparator)) {
 		acc = append(acc, element)
 		if err := os.Chmod(filepath.Join(acc...), perm); err != nil {
-			errs = multierror.Append(errs, err)
+			errs = errors.Append(errs, err)
 		}
 	}
 
-	return errs.ErrorOrNil()
+	return errs
 }

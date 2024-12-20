@@ -8,14 +8,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
+	"runtime"
 	"strings"
 
 	ioaux "github.com/jig/teereadcloser"
 	"github.com/kballard/go-shellquote"
 	"github.com/mattn/go-isatty"
+
+	"github.com/sourcegraph/src-cli/internal/version"
 )
 
 // Client instances provide methods to create API requests.
@@ -26,13 +29,6 @@ type Client interface {
 
 	// NewRequest creates a GraphQL request.
 	NewRequest(query string, vars map[string]interface{}) Request
-
-	// NewGzippedRequest creates a GraphQL request with gzip compression turned on.
-	NewGzippedRequest(query string, vars map[string]interface{}) Request
-
-	// NewGzippedQuery is a convenience wrapper around NewQuery with gzip
-	// compression turned on.
-	NewGzippedQuery(query string) Request
 
 	// NewHTTPRequest creates an http.Request for the Sourcegraph API.
 	//
@@ -71,7 +67,6 @@ type request struct {
 	client *client
 	query  string
 	vars   map[string]interface{}
-	gzip   bool
 }
 
 // ClientOpts encapsulates the options given to NewClient.
@@ -87,6 +82,9 @@ type ClientOpts struct {
 	// Out is the writer that will be used when outputting diagnostics, such as
 	// curl commands when -get-curl is enabled.
 	Out io.Writer
+
+	ProxyURL  *url.URL
+	ProxyPath string
 }
 
 // NewClient creates a new API client.
@@ -101,9 +99,26 @@ func NewClient(opts ClientOpts) Client {
 	}
 
 	httpClient := http.DefaultClient
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	customTransport := false
+
 	if flags.insecureSkipVerify != nil && *flags.insecureSkipVerify {
+		customTransport = true
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+
+	if applyProxy(transport, opts.ProxyURL, opts.ProxyPath) {
+		customTransport = true
+	}
+
+	if customTransport {
 		httpClient = &http.Client{
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+			Transport: transport,
 		}
 	}
 
@@ -118,7 +133,6 @@ func NewClient(opts ClientOpts) Client {
 		httpClient: httpClient,
 	}
 }
-
 func (c *client) NewQuery(query string) Request {
 	return c.NewRequest(query, nil)
 }
@@ -129,19 +143,6 @@ func (c *client) NewRequest(query string, vars map[string]interface{}) Request {
 		query:  query,
 		vars:   vars,
 	}
-}
-
-func (c *client) NewGzippedRequest(query string, vars map[string]interface{}) Request {
-	return &request{
-		client: c,
-		query:  query,
-		vars:   vars,
-		gzip:   true,
-	}
-}
-
-func (c *client) NewGzippedQuery(query string) Request {
-	return c.NewGzippedRequest(query, nil)
 }
 
 func (c *client) Do(req *http.Request) (*http.Response, error) {
@@ -161,6 +162,11 @@ func (c *client) createHTTPRequest(ctx context.Context, method, p string, body i
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.opts.Endpoint, "/")+"/"+p, body)
 	if err != nil {
 		return nil, err
+	}
+	if c.opts.Flags.UserAgentTelemetry() {
+		req.Header.Set("User-Agent", fmt.Sprintf("src-cli/%s %s %s", version.BuildTag, runtime.GOOS, runtime.GOARCH))
+	} else {
+		req.Header.Set("User-Agent", "src-cli/"+version.BuildTag)
 	}
 	if c.opts.AccessToken != "" {
 		req.Header.Set("Authorization", "token "+c.opts.AccessToken)
@@ -210,9 +216,7 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 	}
 
 	var bufBody io.Reader = bytes.NewBuffer(reqBody)
-	if r.gzip {
-		bufBody = gzipReader(bufBody)
-	}
+	bufBody = gzipReader(bufBody)
 
 	// Create the HTTP request.
 	req, err := r.client.NewHTTPRequest(ctx, "POST", ".api/graphql", bufBody)
@@ -220,9 +224,8 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 		return false, err
 	}
 
-	if r.gzip {
-		req.Header.Set("Content-Encoding", "gzip")
-	}
+	// Use gzip compression.
+	req.Header.Set("Content-Encoding", "gzip")
 
 	// Perform the request.
 	resp, err := r.client.httpClient.Do(req)
@@ -248,7 +251,7 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 			fmt.Println("See https://github.com/sourcegraph/src-cli#readme")
 			fmt.Println("")
 		}
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return false, err
 		}

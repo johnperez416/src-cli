@@ -19,15 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	goexec "os/exec"
 	"testing"
 
 	"github.com/gobwas/glob"
 	"github.com/google/go-cmp/cmp"
-	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 
 	"github.com/sourcegraph/src-cli/internal/exec"
 )
@@ -95,7 +93,7 @@ func Commands(t *testing.T, exp ...*Expectation) {
 		cmd.Args = []string{}
 
 		// Actually create the behaviour file.
-		f, err := ioutil.TempFile(os.TempDir(), "behaviour")
+		f, err := os.CreateTemp(os.TempDir(), "behaviour")
 		if err != nil {
 			t.Fatalf("error creating behaviour file: %v", err)
 		}
@@ -143,7 +141,7 @@ func Handle(m interface{ Run() int }) int {
 		}
 
 		// Load up the expected behaviour of this command.
-		data, err := ioutil.ReadFile(file)
+		data, err := os.ReadFile(file)
 		if err != nil {
 			panicErr(err)
 		}
@@ -195,22 +193,46 @@ func NewGlobValidator(wantName string, wantArg ...string) CommandValidator {
 	}
 
 	return func(haveName string, haveArg ...string) error {
-		var errs *multierror.Error
+		var errs errors.MultiError
 
 		if !wantNameGlob.Match(haveName) {
-			errs = multierror.Append(errs, errors.Errorf("name does not match: have=%q want=%q", haveName, wantName))
+			errs = errors.Append(errs, errors.Errorf("name does not match: have=%q want=%q", haveName, wantName))
 		}
 
 		if len(haveArg) != len(wantArgGlobs) {
-			errs = multierror.Append(errs, errors.Errorf("unexpected number of arguments:\nhave=%v\nwant=%v", haveArg, wantArg))
+			errs = errors.Append(errs, errors.Errorf("unexpected number of arguments:\nhave=%v\nwant=%v", haveArg, wantArg))
 		} else {
 			for i, g := range wantArgGlobs {
 				if !g.Match(haveArg[i]) {
-					errs = multierror.Append(errs, errors.Errorf("unexpected argument at position %d:\nhave=%q\nwant=%q\ndiff=%q", i, haveArg[i], wantArg[i], cmp.Diff(haveArg[i], wantArg[i])))
+					errs = errors.Append(errs, errors.Errorf("unexpected argument at position %d:\nhave=%q\nwant=%q\ndiff=%q", i, haveArg[i], wantArg[i], cmp.Diff(haveArg[i], wantArg[i])))
 				}
 			}
 		}
 
-		return errs.ErrorOrNil()
+		return errs
+	}
+}
+
+// NewLiteral is a convenience function that creates an Expectation that
+// validates commands literally.
+//
+// You don't need to use this, but it tends to make Commands() calls more
+// readable.
+func NewLiteral(behaviour Behaviour, wantName string, wantArg ...string) *Expectation {
+	return &Expectation{
+		Behaviour: behaviour,
+		Validator: func(haveName string, haveArg ...string) error {
+			var errs errors.MultiError
+
+			if wantName != haveName {
+				errs = errors.Append(errs, errors.Errorf("name does not match: have=%q want=%q", haveName, wantName))
+			}
+
+			if diff := cmp.Diff(haveArg, wantArg); diff != "" {
+				errs = errors.Append(errs, errors.Errorf("arguments do not match (-have +want):\n%s", diff))
+			}
+
+			return errs
+		},
 	}
 }

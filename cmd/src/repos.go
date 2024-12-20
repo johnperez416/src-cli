@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sourcegraph/sourcegraph/lib/errors"
+
 	"github.com/sourcegraph/src-cli/internal/api"
 )
 
@@ -20,9 +22,12 @@ Usage:
 
 The commands are:
 
-	get        gets a repository
-	list       lists repositories
-	delete 	   deletes repositories
+	get        		gets a repository
+	list       		lists repositories
+	delete 	   		deletes repositories
+	add-metadata    adds a key-value pair metadata to a repository
+	update-metadata updates a key-value pair metadata on a repository
+	delete-metadata deletes a key-value pair metadata from a repository
 
 Use "src repos [command] -h" for more information about a command.
 `
@@ -63,6 +68,10 @@ fragment RepositoryFields on Repository {
 		displayName
 	}
 	viewerCanAdminister
+	keyValuePairs {
+		key
+		value
+	}
 }
 `
 
@@ -77,6 +86,12 @@ type Repository struct {
 	ExternalRepository  ExternalRepository `json:"externalRepository"`
 	DefaultBranch       GitRef             `json:"defaultBranch"`
 	ViewerCanAdminister bool               `json:"viewerCanAdminister"`
+	KeyValuePairs       []KeyValuePair     `json:"keyValuePairs"`
+}
+
+type KeyValuePair struct {
+	Key   string  `json:"key"`
+	Value *string `json:"value"`
 }
 
 type ExternalRepository struct {
@@ -111,4 +126,14 @@ func fetchRepositoryID(ctx context.Context, client api.Client, repoName string) 
 		return "", fmt.Errorf("repository not found: %s", repoName)
 	}
 	return result.Repository.ID, nil
+}
+
+func getRepoIdOrError(ctx context.Context, client api.Client, id *string, repoName *string) (*string, error) {
+	if *id != "" {
+		return id, nil
+	} else if *repoName != "" {
+		repoID, err := fetchRepositoryID(ctx, client, *repoName)
+		return &repoID, err
+	}
+	return nil, errors.New("error: repo or repoName is required")
 }

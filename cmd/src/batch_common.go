@@ -5,108 +5,151 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	cliLog "log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/hashicorp/go-multierror"
-	"github.com/neelance/parallel"
-	"github.com/pkg/errors"
+	"github.com/mattn/go-isatty"
+
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 	"github.com/sourcegraph/sourcegraph/lib/output"
+
+	batcheslib "github.com/sourcegraph/sourcegraph/lib/batches"
+	"github.com/sourcegraph/sourcegraph/lib/batches/template"
+
 	"github.com/sourcegraph/src-cli/internal/api"
 	"github.com/sourcegraph/src-cli/internal/batches"
+	"github.com/sourcegraph/src-cli/internal/batches/docker"
 	"github.com/sourcegraph/src-cli/internal/batches/executor"
 	"github.com/sourcegraph/src-cli/internal/batches/graphql"
+	"github.com/sourcegraph/src-cli/internal/batches/log"
+	"github.com/sourcegraph/src-cli/internal/batches/repozip"
 	"github.com/sourcegraph/src-cli/internal/batches/service"
+	"github.com/sourcegraph/src-cli/internal/batches/ui"
+	"github.com/sourcegraph/src-cli/internal/batches/watchdog"
 	"github.com/sourcegraph/src-cli/internal/batches/workspace"
+	"github.com/sourcegraph/src-cli/internal/cmderrors"
 )
 
-var (
-	batchPendingColor = output.StylePending
-	batchSuccessColor = output.StyleSuccess
-	batchSuccessEmoji = output.EmojiSuccess
-)
+// We check for docker responsiveness every minute
+const dockerWatchDuration = 1 * time.Minute
 
-type batchExecuteFlags struct {
+// batchExecutionFlags are common to batch changes that are executed both
+// locally and remotely.
+type batchExecutionFlags struct {
 	allowUnsupported bool
 	allowIgnored     bool
 	api              *api.Flags
-	apply            bool
-	cacheDir         string
-	tempDir          string
 	clearCache       bool
-	file             string
-	keepLogs         bool
 	namespace        string
-	parallelism      int
-	timeout          time.Duration
-	workspace        string
-	cleanArchives    bool
 	skipErrors       bool
 }
 
-func newBatchExecuteFlags(flagSet *flag.FlagSet, cacheDir, tempDir string) *batchExecuteFlags {
-	caf := &batchExecuteFlags{
+func newBatchExecutionFlags(flagSet *flag.FlagSet) *batchExecutionFlags {
+	bef := &batchExecutionFlags{
 		api: api.NewFlags(flagSet),
 	}
 
 	flagSet.BoolVar(
-		&caf.allowUnsupported, "allow-unsupported", false,
+		&bef.allowUnsupported, "allow-unsupported", false,
 		"Allow unsupported code hosts.",
 	)
 	flagSet.BoolVar(
-		&caf.allowIgnored, "force-override-ignore", false,
+		&bef.clearCache, "clear-cache", false,
+		"If true, clears the execution cache and executes all steps anew.",
+	)
+	flagSet.BoolVar(
+		&bef.skipErrors, "skip-errors", false,
+		"If true, errors encountered won't stop the program, but only log them.",
+	)
+	flagSet.BoolVar(
+		&bef.allowIgnored, "force-override-ignore", false,
 		"Do not ignore repositories that have a .batchignore file.",
 	)
+	flagSet.StringVar(
+		&bef.namespace, "namespace", "",
+		"The user or organization namespace to place the batch change within. Default is the currently authenticated user.",
+	)
+	flagSet.StringVar(&bef.namespace, "n", "", "Alias for -namespace.")
+
+	return bef
+}
+
+// batchExecuteFlags are used when executing batch changes locally.
+type batchExecuteFlags struct {
+	*batchExecutionFlags
+
+	apply         bool
+	cacheDir      string
+	tempDir       string
+	file          string
+	keepLogs      bool
+	parallelism   int
+	timeout       time.Duration
+	workspace     string
+	cleanArchives bool
+	skipErrors    bool
+	runAsRoot     bool
+
+	// EXPERIMENTAL
+	textOnly bool
+}
+
+func newBatchExecuteFlags(flagSet *flag.FlagSet, cacheDir, tempDir string) *batchExecuteFlags {
+	caf := &batchExecuteFlags{
+		batchExecutionFlags: newBatchExecutionFlags(flagSet),
+	}
+
+	flagSet.BoolVar(
+		&caf.textOnly, "text-only", false,
+		"INTERNAL USE ONLY. EXPERIMENTAL. Switches off the TUI to only print JSON lines.",
+	)
+
 	flagSet.BoolVar(
 		&caf.apply, "apply", false,
 		"Ignored.",
 	)
-	flagSet.StringVar(
-		&caf.cacheDir, "cache", cacheDir,
-		"Directory for caching results and repository archives.",
-	)
-	flagSet.BoolVar(
-		&caf.clearCache, "clear-cache", false,
-		"If true, clears the execution cache and executes all steps anew.",
-	)
-	flagSet.StringVar(
-		&caf.tempDir, "tmp", tempDir,
-		"Directory for storing temporary data, such as log files. Default is /tmp. Can also be set with environment variable SRC_BATCH_TMP_DIR; if both are set, this flag will be used and not the environment variable.",
-	)
-	flagSet.StringVar(
-		&caf.file, "f", "",
-		"The batch spec file to read.",
-	)
+
 	flagSet.BoolVar(
 		&caf.keepLogs, "keep-logs", false,
 		"Retain logs after executing steps.",
 	)
+
 	flagSet.StringVar(
-		&caf.namespace, "namespace", "",
-		"The user or organization namespace to place the batch change within. Default is the currently authenticated user.",
+		&caf.cacheDir, "cache", cacheDir,
+		"Directory for caching results and repository archives.",
 	)
-	flagSet.StringVar(&caf.namespace, "n", "", "Alias for -namespace.")
+
+	flagSet.StringVar(
+		&caf.tempDir, "tmp", tempDir,
+		"Directory for storing temporary data, such as log files. Default is /tmp. Can also be set with environment variable SRC_BATCH_TMP_DIR; if both are set, this flag will be used and not the environment variable.",
+	)
+
+	flagSet.StringVar(
+		&caf.file, "f", "",
+		"The batch spec file to read, or - to read from standard input.",
+	)
 
 	flagSet.IntVar(
-		&caf.parallelism, "j", runtime.GOMAXPROCS(0),
-		"The maximum number of parallel jobs. Default is GOMAXPROCS.",
+		&caf.parallelism, "j", 0,
+		"The maximum number of parallel jobs. Default (or 0) is the number of CPU cores available to Docker.",
 	)
+
 	flagSet.DurationVar(
 		&caf.timeout, "timeout", 60*time.Minute,
 		"The maximum duration a single batch spec step can take.",
 	)
+
 	flagSet.BoolVar(
 		&caf.cleanArchives, "clean-archives", true,
-		"If true, deletes downloaded repository archives after executing batch spec steps.",
-	)
-	flagSet.BoolVar(
-		&caf.skipErrors, "skip-errors", false,
-		"If true, errors encountered while executing steps in a repository won't stop the execution of the batch spec but only cause that repository to be skipped.",
+		"If true, deletes downloaded repository archives after executing batch spec steps. Note that only the archives related to the actual repositories matched by the batch spec will be cleaned up, and clean up will not occur if src exits unexpectedly.",
 	)
 
 	flagSet.StringVar(
@@ -116,15 +159,29 @@ func newBatchExecuteFlags(flagSet *flag.FlagSet, cacheDir, tempDir string) *batc
 
 	flagSet.BoolVar(verbose, "v", false, "print verbose output")
 
+	flagSet.BoolVar(
+		&caf.runAsRoot, "run-as-root", false,
+		"If true, forces all step containers to run as root.",
+	)
+
 	return caf
 }
 
-func batchCreatePending(out *output.Output, message string) output.Pending {
-	return out.Pending(output.Line("", batchPendingColor, message))
-}
+var errAdditionalArguments = cmderrors.Usage("additional arguments not allowed")
 
-func batchCompletePending(p output.Pending, message string) {
-	p.Complete(output.Line(batchSuccessEmoji, batchSuccessColor, message))
+func getBatchSpecFile(flagSet *flag.FlagSet, fileFlag *string) (string, error) {
+	if fileFlag == nil || *fileFlag != "" {
+		if flagSet.NArg() != 0 {
+			return "", errAdditionalArguments
+		}
+		if fileFlag == nil {
+			return "", nil
+		}
+		return *fileFlag, nil
+	} else if flagSet.NArg() > 1 {
+		return "", errAdditionalArguments
+	}
+	return flagSet.Arg(0), nil
 }
 
 func batchDefaultCacheDir() string {
@@ -132,37 +189,17 @@ func batchDefaultCacheDir() string {
 	if err != nil {
 		return ""
 	}
-
-	// Check if there's an old campaigns cache directory but not a new batch
-	// directory: if so, we should rename the old directory and carry on.
-	//
-	// TODO(campaigns-deprecation): we can remove this migration shim after June
-	// 2021.
-	old := path.Join(uc, "sourcegraph", "campaigns")
 	dir := path.Join(uc, "sourcegraph", "batch")
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if _, err := os.Stat(old); os.IsExist(err) {
-			// We'll just try to do this without checking for an error: if it
-			// fails, we'll carry on and let the normal cache directory handling
-			// logic take care of it.
-			os.Rename(old, dir)
-		}
-	}
 
 	return dir
 }
 
 // batchDefaultTempDirPrefix returns the prefix to be passed to ioutil.TempFile.
-// If one of the environment variables SRC_BATCH_TMP_DIR or
-// SRC_CAMPAIGNS_TMP_DIR is set, that is used as the prefix. Otherwise we use
-// "/tmp".
+// If the environment variable SRC_BATCH_TMP_DIR is set, that is used as the prefix.
+// Otherwise we use "/tmp".
 func batchDefaultTempDirPrefix() string {
-	// TODO(campaigns-deprecation): we can remove this migration shim in
-	// Sourcegraph 4.0.
-	for _, env := range []string{"SRC_BATCH_TMP_DIR", "SRC_CAMPAIGNS_TMP_DIR"} {
-		if p := os.Getenv(env); p != "" {
-			return p
-		}
+	if p := os.Getenv("SRC_BATCH_TMP_DIR"); p != "" {
+		return p
 	}
 
 	// On macOS, we use an explicit prefix for our temp directories, because
@@ -176,14 +213,36 @@ func batchDefaultTempDirPrefix() string {
 	return os.TempDir()
 }
 
-func batchOpenFileFlag(flag *string) (io.ReadCloser, error) {
-	if flag == nil || *flag == "" || *flag == "-" {
-		return os.Stdin, nil
+func batchOpenFileFlag(flag string) (*os.File, error) {
+	if flag == "" || flag == "-" {
+		if flag != "-" {
+			// If the flag wasn't set, we want to check stdin. If it's not a TTY,
+			// then we'll assume that we always want to read from it. If it is a TTY,
+			// then we'll briefly pause to see if data is getting piped in, otherwise
+			// we'll error out, because it's likely that the user forgot the `-f` on
+			// the command line.
+			fd := os.Stdin.Fd()
+			if isatty.IsTerminal(fd) {
+				has, err := ui.HasInput(os.Stdin.Fd(), 250*time.Millisecond)
+				if err != nil {
+					return nil, errors.Wrap(err, "checking for input on stdin")
+				} else if !has {
+					return nil, errors.New("-f specified, but no input was detected on stdin; did you forget to pipe a batch spec in?")
+				}
+			}
+		}
+		// https://github.com/golang/go/issues/24842
+		if err := syscall.SetNonblock(0, true); err != nil {
+			panic(err)
+		}
+		stdin := os.NewFile(0, "stdin")
+
+		return stdin, nil
 	}
 
-	file, err := os.Open(*flag)
+	file, err := os.Open(flag)
 	if err != nil {
-		return nil, errors.Wrapf(err, "cannot open file %q", *flag)
+		return nil, errors.Wrapf(err, "cannot open file %s", flag)
 	}
 	return file, nil
 }
@@ -192,161 +251,253 @@ type executeBatchSpecOpts struct {
 	flags *batchExecuteFlags
 
 	applyBatchSpec bool
+	file           string
 
-	out    *output.Output
 	client api.Client
+}
+
+func createDockerWatchdog(ctx context.Context, execUI ui.ExecUI) *watchdog.WatchDog {
+	return watchdog.New(dockerWatchDuration, func() {
+		_, err := docker.NCPU(ctx)
+		if err != nil {
+			execUI.DockerWatchDogWarning(errors.Wrap(err, "docker watchdog"))
+		}
+	})
 }
 
 // executeBatchSpec performs all the steps required to upload the batch spec to
 // Sourcegraph, including execution as needed and applying the resulting batch
 // spec if specified.
-func executeBatchSpec(ctx context.Context, opts executeBatchSpecOpts) error {
+func executeBatchSpec(ctx context.Context, opts executeBatchSpecOpts) (err error) {
+	var execUI ui.ExecUI
+	if opts.flags.textOnly {
+		execUI = &ui.JSONLines{}
+	} else {
+		out := output.NewOutput(os.Stderr, output.OutputOpts{Verbose: *verbose})
+		execUI = &ui.TUI{Out: out}
+	}
+
+	w := createDockerWatchdog(ctx, execUI)
+	go w.Start()
+
+	defer func() {
+		w.Stop()
+		if err != nil {
+			execUI.ExecutionError(err)
+		}
+	}()
+
 	svc := service.New(&service.Opts{
-		AllowUnsupported: opts.flags.allowUnsupported,
-		AllowIgnored:     opts.flags.allowIgnored,
-		Client:           opts.client,
+		Client: opts.client,
 	})
 
-	if err := svc.DetermineFeatureFlags(ctx); err != nil {
+	lr, ffs, err := svc.DetermineLicenseAndFeatureFlags(ctx, opts.flags.skipErrors)
+	if err != nil {
 		return err
+	}
+
+	// Once we know about feature flags, reconfigure the UI if needed.
+	if opts.flags.textOnly && ffs.BinaryDiffs {
+		execUI = &ui.JSONLines{BinaryDiffs: true}
+	}
+
+	imageCache := docker.NewImageCache()
+
+	if err := validateSourcegraphVersionConstraint(ffs); err != nil {
+		if !opts.flags.skipErrors {
+			return err
+		} else {
+			cliLog.Printf("WARNING: %s", err)
+		}
 	}
 
 	if err := checkExecutable("git", "version"); err != nil {
 		return err
 	}
 
-	if err := checkExecutable("docker", "version"); err != nil {
+	// In the past, we relied on `getBatchParallelism` to ascertain if docker is running,
+	// however, we don't always check for the number of CPUs (especially when the -j parallelis)
+	// flag is passed. This is a more explicit check to confirm docker is working.
+	if err := docker.CheckVersion(ctx); err != nil {
 		return err
 	}
 
-	// Parse flags and build up our service and executor options.
-	pending := batchCreatePending(opts.out, "Parsing batch spec")
-	batchSpec, rawSpec, err := batchParseSpec(opts.out, &opts.flags.file, svc)
+	parallelism, err := getBatchParallelism(ctx, opts.flags.parallelism)
 	if err != nil {
 		return err
 	}
-	batchCompletePending(pending, "Parsing batch spec")
 
-	pending = batchCreatePending(opts.out, "Resolving namespace")
+	// On Linux only, we also need to figure out if we need to override the
+	// temporary directory — Docker Desktop restricts file mounts to /home only
+	// by default.
+	//
+	// We could interrogate ~/.docker/desktop/settings.json for extra bonus
+	// points here, but that feels like overkill. Basically, if it's
+	// desktop-linux, we'll just assume the user has the default /home mount
+	// available and go from there.
+	if runtime.GOOS == "linux" && opts.flags.tempDir == batchDefaultTempDirPrefix() {
+		context, err := docker.CurrentContext(ctx)
+		if err != nil {
+			return err
+		}
+
+		if context == "desktop-linux" {
+			opts.flags.tempDir = path.Join(path.Dir(opts.flags.cacheDir), "batch-tmp")
+
+			// Ensure the directory exists and is writable.
+			os.MkdirAll(opts.flags.tempDir, os.ModePerm)
+		}
+	}
+
+	// Parse flags and build up our service and executor options.
+	execUI.ParsingBatchSpec()
+	batchSpec, batchSpecDir, rawSpec, err := parseBatchSpec(ctx, opts.file, svc)
+	if err != nil {
+		var multiErr errors.MultiError
+		if errors.As(err, &multiErr) {
+			execUI.ParsingBatchSpecFailure(multiErr)
+			return cmderrors.ExitCode(2, nil)
+		} else {
+			// This shouldn't happen; let's just punt and let the normal
+			// rendering occur.
+			return err
+		}
+	}
+	execUI.ParsingBatchSpecSuccess()
+
+	execUI.ResolvingNamespace()
 	namespace, err := svc.ResolveNamespace(ctx, opts.flags.namespace)
 	if err != nil {
 		return err
 	}
-	batchCompletePending(pending, "Resolving namespace")
+	execUI.ResolvingNamespaceSuccess(namespace.ID)
 
-	imageProgress := opts.out.Progress([]output.ProgressBar{{
-		Label: "Preparing container images",
-		Max:   1.0,
-	}}, nil)
-	err = svc.SetDockerImages(ctx, batchSpec, func(perc float64) {
-		imageProgress.SetValue(0, perc)
-	})
-	if err != nil {
-		return err
-	}
-	imageProgress.Complete()
+	var workspaceCreator workspace.Creator
 
-	pending = batchCreatePending(opts.out, "Determining workspace type")
-	workspaceCreator := workspace.NewCreator(ctx, opts.flags.workspace, opts.flags.cacheDir, opts.flags.tempDir, batchSpec.Steps)
-	if workspaceCreator.Type() == workspace.CreatorTypeVolume {
-		_, err = svc.EnsureImage(ctx, workspace.DockerVolumeWorkspaceImage)
+	if len(batchSpec.Steps) > 0 {
+		execUI.PreparingContainerImages()
+		images, err := svc.EnsureDockerImages(
+			ctx,
+			imageCache,
+			batchSpec.Steps,
+			parallelism,
+			execUI.PreparingContainerImagesProgress,
+		)
 		if err != nil {
 			return err
 		}
+		execUI.PreparingContainerImagesSuccess()
+
+		execUI.DeterminingWorkspaceCreatorType()
+		var typ workspace.CreatorType
+		workspaceCreator, typ = workspace.NewCreator(ctx, opts.flags.workspace, opts.flags.cacheDir, opts.flags.tempDir, images)
+		if typ == workspace.CreatorTypeVolume {
+			// This creator type requires an additional image, so let's ensure it exists.
+			_, err = imageCache.Ensure(ctx, workspace.DockerVolumeWorkspaceImage)
+			if err != nil {
+				return err
+			}
+		}
+		execUI.DeterminingWorkspaceCreatorTypeSuccess(typ)
 	}
 
-	pending.VerboseLine(output.Linef("🚧", output.StyleSuccess, "Workspace creator: %T", workspaceCreator))
-	batchCompletePending(pending, "Set workspace type")
-
-	pending = batchCreatePending(opts.out, "Resolving repositories")
-	repos, err := svc.ResolveRepositories(ctx, batchSpec)
+	execUI.DeterminingWorkspaces()
+	workspaces, repos, err := svc.ResolveWorkspacesForBatchSpec(ctx, batchSpec, opts.flags.allowUnsupported, opts.flags.allowIgnored)
 	if err != nil {
 		if repoSet, ok := err.(batches.UnsupportedRepoSet); ok {
-			batchCompletePending(pending, "Resolved repositories")
-
-			block := opts.out.Block(output.Line(" ", output.StyleWarning, "Some repositories are hosted on unsupported code hosts and will be skipped. Use the -allow-unsupported flag to avoid skipping them."))
-			for repo := range repoSet {
-				block.Write(repo.Name)
-			}
-			block.Close()
+			execUI.DeterminingWorkspacesSuccess(len(workspaces), len(repos), repoSet, nil)
 		} else if repoSet, ok := err.(batches.IgnoredRepoSet); ok {
-			batchCompletePending(pending, "Resolved repositories")
-
-			block := opts.out.Block(output.Line(" ", output.StyleWarning, "The repositories listed below contain .batchignore files and will be skipped. Use the -force-override-ignore flag to avoid skipping them."))
-			for repo := range repoSet {
-				block.Write(repo.Name)
-			}
-			block.Close()
+			execUI.DeterminingWorkspacesSuccess(len(workspaces), len(repos), nil, repoSet)
 		} else {
 			return errors.Wrap(err, "resolving repositories")
 		}
 	} else {
-		batchCompletePending(pending, fmt.Sprintf("Resolved %d repositories", len(repos)))
+		execUI.DeterminingWorkspacesSuccess(len(workspaces), len(repos), nil, nil)
 	}
 
-	pending = batchCreatePending(opts.out, "Determining workspaces")
-	tasks, err := svc.BuildTasks(ctx, repos, batchSpec)
-	if err != nil {
-		return err
-	}
-	batchCompletePending(pending, fmt.Sprintf("Found %d workspaces with steps to execute", len(tasks)))
+	archiveRegistry := repozip.NewArchiveRegistry(opts.client, opts.flags.cacheDir, opts.flags.cleanArchives)
+	logManager := log.NewDiskManager(opts.flags.tempDir, opts.flags.keepLogs)
+	coord := executor.NewCoordinator(
+		executor.NewCoordinatorOpts{
+			ExecOpts: executor.NewExecutorOpts{
+				Logger:              logManager,
+				RepoArchiveRegistry: archiveRegistry,
+				Creator:             workspaceCreator,
+				EnsureImage:         imageCache.Ensure,
+				Parallelism:         parallelism,
+				WorkingDirectory:    batchSpecDir,
+				Timeout:             opts.flags.timeout,
+				TempDir:             opts.flags.tempDir,
+				GlobalEnv:           os.Environ(),
+				ForceRoot:           opts.flags.runAsRoot,
+				BinaryDiffs:         ffs.BinaryDiffs,
+			},
+			Logger:      logManager,
+			Cache:       executor.NewDiskCache(opts.flags.cacheDir),
+			BinaryDiffs: ffs.BinaryDiffs,
+			GlobalEnv:   os.Environ(),
+		},
+	)
 
-	// EXECUTION OF TASKS
-	coord := svc.NewCoordinator(executor.NewCoordinatorOpts{
-		Creator:       workspaceCreator,
-		CacheDir:      opts.flags.cacheDir,
-		ClearCache:    opts.flags.clearCache,
-		SkipErrors:    opts.flags.skipErrors,
-		CleanArchives: opts.flags.cleanArchives,
-		Parallelism:   opts.flags.parallelism,
-		Timeout:       opts.flags.timeout,
-		KeepLogs:      opts.flags.keepLogs,
-		TempDir:       opts.flags.tempDir,
-	})
-
-	pending = batchCreatePending(opts.out, "Checking cache for changeset specs")
-	uncachedTasks, cachedSpecs, err := coord.CheckCache(ctx, tasks)
-	if err != nil {
-		return err
-	}
-	var specsFoundMessage string
-	if len(cachedSpecs) == 1 {
-		specsFoundMessage = "Found 1 cached changeset spec"
+	execUI.CheckingCache()
+	tasks := svc.BuildTasks(
+		&template.BatchChangeAttributes{
+			Name:        batchSpec.Name,
+			Description: batchSpec.Description,
+		},
+		batchSpec.Steps,
+		workspaces,
+	)
+	var (
+		specs         []*batcheslib.ChangesetSpec
+		uncachedTasks []*executor.Task
+	)
+	if opts.flags.clearCache {
+		if err := coord.ClearCache(ctx, tasks); err != nil {
+			return err
+		}
+		uncachedTasks = tasks
 	} else {
-		specsFoundMessage = fmt.Sprintf("Found %d cached changeset specs", len(cachedSpecs))
+		// Check the cache for completely cached executions.
+		uncachedTasks, specs, err = coord.CheckCache(ctx, batchSpec, tasks)
+		if err != nil {
+			return err
+		}
 	}
-	switch len(uncachedTasks) {
-	case 0:
-		batchCompletePending(pending, fmt.Sprintf("%s; no tasks need to be executed", specsFoundMessage))
-	case 1:
-		batchCompletePending(pending, fmt.Sprintf("%s; %d task needs to be executed", specsFoundMessage, len(uncachedTasks)))
-	default:
-		batchCompletePending(pending, fmt.Sprintf("%s; %d tasks need to be executed", specsFoundMessage, len(uncachedTasks)))
-	}
+	execUI.CheckingCacheSuccess(len(specs), len(uncachedTasks))
 
-	p := newBatchProgressPrinter(opts.out, *verbose, opts.flags.parallelism)
-	freshSpecs, logFiles, err := coord.Execute(ctx, uncachedTasks, batchSpec, p.PrintStatuses)
+	taskExecUI := execUI.ExecutingTasks(*verbose, parallelism)
+	freshSpecs, logFiles, execErr := coord.ExecuteAndBuildSpecs(ctx, batchSpec, uncachedTasks, taskExecUI)
+	// Add external changeset specs.
+	importedSpecs, importErr := svc.CreateImportChangesetSpecs(ctx, batchSpec)
+	if execErr != nil {
+		err = errors.Append(err, execErr)
+	}
+	if importErr != nil {
+		err = errors.Append(err, importErr)
+	}
 	if err != nil && !opts.flags.skipErrors {
 		return err
 	}
-	p.Complete()
-	if err != nil && opts.flags.skipErrors {
-		printExecutionError(opts.out, err)
-		opts.out.WriteLine(output.Line(output.EmojiWarning, output.StyleWarning, "Skipping errors because -skip-errors was used."))
+	if err == nil || opts.flags.skipErrors {
+		if err == nil {
+			taskExecUI.Success()
+		} else {
+			execUI.ExecutingTasksSkippingErrors(err)
+		}
+	} else {
+		if err != nil {
+			taskExecUI.Failed(err)
+			return err
+		}
 	}
 
 	if len(logFiles) > 0 && opts.flags.keepLogs {
-		func() {
-			block := opts.out.Block(output.Line("", batchSuccessColor, "Preserving log files:"))
-			defer block.Close()
-
-			for _, file := range logFiles {
-				block.Write(file)
-			}
-		}()
+		execUI.LogFilesKept(logFiles)
 	}
 
-	specs := append(cachedSpecs, freshSpecs...)
+	specs = append(specs, freshSpecs...)
+	specs = append(specs, importedSpecs...)
 
 	err = svc.ValidateChangesetSpecs(repos, specs)
 	if err != nil {
@@ -356,16 +507,7 @@ func executeBatchSpec(ctx context.Context, opts executeBatchSpecOpts) error {
 	ids := make([]graphql.ChangesetSpecID, len(specs))
 
 	if len(specs) > 0 {
-		var label string
-		if len(specs) == 1 {
-			label = "Sending changeset spec"
-		} else {
-			label = fmt.Sprintf("Sending %d changeset specs", len(specs))
-		}
-
-		progress := opts.out.Progress([]output.ProgressBar{
-			{Label: label, Max: float64(len(specs))},
-		}, nil)
+		execUI.UploadingChangesetSpecs(len(specs))
 
 		for i, spec := range specs {
 			id, err := svc.CreateChangesetSpec(ctx, spec)
@@ -373,226 +515,115 @@ func executeBatchSpec(ctx context.Context, opts executeBatchSpecOpts) error {
 				return err
 			}
 			ids[i] = id
-			progress.SetValue(0, float64(i+1))
+			execUI.UploadingChangesetSpecsProgress(i+1, len(specs))
 		}
-		progress.Complete()
-	} else {
-		if len(repos) == 0 {
-			opts.out.WriteLine(output.Linef(output.EmojiWarning, output.StyleWarning, `No changeset specs created`))
-		}
+
+		execUI.UploadingChangesetSpecsSuccess(ids)
+	} else if len(repos) == 0 {
+		execUI.NoChangesetSpecs()
 	}
 
-	pending = batchCreatePending(opts.out, "Creating batch spec on Sourcegraph")
-	id, url, err := svc.CreateBatchSpec(ctx, namespace, rawSpec, ids)
-	batchCompletePending(pending, "Creating batch spec on Sourcegraph")
+	execUI.CreatingBatchSpec()
+	id, url, err := svc.CreateBatchSpec(ctx, namespace.ID, rawSpec, ids)
 	if err != nil {
-		return prettyPrintBatchUnlicensedError(opts.out, err)
+		return execUI.CreatingBatchSpecError(lr.MaxUnlicensedChangesets, err)
 	}
+	previewURL := cfg.Endpoint + url
+	execUI.CreatingBatchSpecSuccess(previewURL)
 
-	if opts.applyBatchSpec {
-		pending = batchCreatePending(opts.out, "Applying batch spec")
-		batch, err := svc.ApplyBatchChange(ctx, id)
-		if err != nil {
-			return err
+	hasWorkspaceFiles := false
+	for _, step := range batchSpec.Steps {
+		if len(step.Mount) > 0 {
+			hasWorkspaceFiles = true
+			break
 		}
-		batchCompletePending(pending, "Applying batch spec")
-
-		opts.out.Write("")
-		block := opts.out.Block(output.Line(batchSuccessEmoji, batchSuccessColor, "Batch change applied!"))
-		defer block.Close()
-
-		block.Write("To view the batch change, go to:")
-		block.Writef("%s%s", cfg.Endpoint, batch.URL)
-
-	} else {
-		opts.out.Write("")
-		block := opts.out.Block(output.Line(batchSuccessEmoji, batchSuccessColor, "To preview or apply the batch spec, go to:"))
-		defer block.Close()
-
-		block.Writef("%s%s", cfg.Endpoint, url)
 	}
+	if hasWorkspaceFiles {
+		execUI.UploadingWorkspaceFiles()
+		if err := svc.UploadBatchSpecWorkspaceFiles(ctx, batchSpecDir, string(id), batchSpec.Steps); err != nil {
+			// Since failing to upload workspace files should not stop processing, just warn
+			execUI.UploadingWorkspaceFilesWarning(errors.Wrap(err, "uploading workspace files"))
+		} else {
+			execUI.UploadingWorkspaceFilesSuccess()
+		}
+	}
+
+	if !opts.applyBatchSpec {
+		execUI.PreviewBatchSpec(previewURL)
+		return
+	}
+
+	execUI.ApplyingBatchSpec()
+	batch, err := svc.ApplyBatchChange(ctx, id)
+	if err != nil {
+		return err
+	}
+	execUI.ApplyingBatchSpecSuccess(cfg.Endpoint + batch.URL)
 
 	return nil
 }
 
-// batchParseSpec parses and validates the given batch spec. If the spec has
-// validation errors, the errors are output in a human readable form and an
-// exitCodeError is returned.
-func batchParseSpec(out *output.Output, file *string, svc *service.Service) (*batches.BatchSpec, string, error) {
+func setReadDeadlineOnCancel(ctx context.Context, f *os.File) {
+	go func() {
+		// When user cancels, we set the read deadline to now() so the runtime
+		// cancels the read and we don't block.
+		<-ctx.Done()
+		f.SetReadDeadline(time.Now())
+	}()
+}
+
+// parseBatchSpec parses and validates the given batch spec. If the spec has
+// validation errors, they are returned.
+func parseBatchSpec(ctx context.Context, file string, svc *service.Service) (*batcheslib.BatchSpec, string, string, error) {
 	f, err := batchOpenFileFlag(file)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	defer f.Close()
 
-	spec, raw, err := svc.ParseBatchSpec(f)
+	// Create new ctx so we ensure that the goroutine in
+	// setReadDeadlineOnCancel exits at end of function.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	setReadDeadlineOnCancel(ctx, f)
+
+	data, err := io.ReadAll(f)
 	if err != nil {
-		if merr, ok := err.(*multierror.Error); ok {
-			block := out.Block(output.Line("\u274c", output.StyleWarning, "Batch spec failed validation."))
-			defer block.Close()
-
-			for i, err := range merr.Errors {
-				block.Writef("%d. %s", i+1, err)
-			}
-
-			return nil, "", &exitCodeError{
-				error:    nil,
-				exitCode: 2,
-			}
-		} else {
-			// This shouldn't happen; let's just punt and let the normal
-			// rendering occur.
-			return nil, "", err
-		}
+		return nil, "", "", errors.Wrap(err, "reading batch spec")
 	}
 
-	return spec, raw, nil
+	dir, err := getBatchSpecDirectory(file)
+	if err != nil {
+		return nil, "", "", errors.Wrap(err, "batch spec path")
+	}
+
+	spec, err := svc.ParseBatchSpec(dir, data)
+	return spec, dir, string(data), err
 }
 
-// printExecutionError is used to print the possible error returned by
-// batchExecute.
-func printExecutionError(out *output.Output, err error) {
-	// exitCodeError shouldn't generate any specific output, since it indicates
-	// that this was done deeper in the call stack.
-	if _, ok := err.(*exitCodeError); ok {
-		return
+func getBatchSpecDirectory(file string) (string, error) {
+	var workingDirectory string
+	var err error
+	// if the batch spec is being provided via standard input, set the working directory to the current directory
+	if file == "" || file == "-" {
+		workingDirectory, err = os.Getwd()
+		if err != nil {
+			return "", errors.Wrap(err, "batch spec path")
+		}
+	} else {
+		p, err := filepath.Abs(file)
+		if err != nil {
+			return "", errors.Wrap(err, "batch spec path")
+		}
+		workingDirectory = filepath.Dir(p)
 	}
-
-	out.Write("")
-
-	writeErrs := func(errs []error) {
-		var block *output.Block
-
-		if len(errs) > 1 {
-			block = out.Block(output.Linef(output.EmojiFailure, output.StyleWarning, "%d errors:", len(errs)))
-		} else {
-			block = out.Block(output.Line(output.EmojiFailure, output.StyleWarning, "Error:"))
-		}
-
-		for _, e := range errs {
-			if taskErr, ok := e.(executor.TaskExecutionErr); ok {
-				block.Write(formatTaskExecutionErr(taskErr))
-			} else {
-				if err == context.Canceled {
-					block.Writef("%sAborting", output.StyleBold)
-				} else {
-					block.Writef("%s%s", output.StyleBold, e.Error())
-				}
-			}
-		}
-
-		if block != nil {
-			block.Close()
-		}
-	}
-
-	switch err := err.(type) {
-	case parallel.Errors, *multierror.Error, api.GraphQlErrors:
-		writeErrs(flattenErrs(err))
-
-	default:
-		writeErrs([]error{err})
-	}
-
-	out.Write("")
-
-	block := out.Block(output.Line(output.EmojiLightbulb, output.StyleSuggestion, "The troubleshooting documentation can help to narrow down the cause of the errors:"))
-	block.WriteLine(output.Line("", output.StyleSuggestion, "https://docs.sourcegraph.com/batch_changes/references/troubleshooting"))
-	block.Close()
-}
-
-func flattenErrs(err error) (result []error) {
-	switch errs := err.(type) {
-	case parallel.Errors:
-		for _, e := range errs {
-			result = append(result, flattenErrs(e)...)
-		}
-
-	case *multierror.Error:
-		for _, e := range errs.Errors {
-			result = append(result, flattenErrs(e)...)
-		}
-
-	case api.GraphQlErrors:
-		for _, e := range errs {
-			result = append(result, flattenErrs(e)...)
-		}
-
-	default:
-		result = append(result, errs)
-	}
-
-	return result
-}
-
-func formatTaskExecutionErr(err executor.TaskExecutionErr) string {
-	if ee, ok := errors.Cause(err).(*exec.ExitError); ok && ee.String() == "signal: killed" {
-		return fmt.Sprintf(
-			"%s%s%s: killed by interrupt signal",
-			output.StyleBold,
-			err.Repository,
-			output.StyleReset,
-		)
-	}
-
-	return fmt.Sprintf(
-		"%s%s%s:\n%s\nLog: %s\n",
-		output.StyleBold,
-		err.Repository,
-		output.StyleReset,
-		err.Err,
-		err.Logfile,
-	)
-}
-
-// prettyPrintBatchUnlicensedError introspects the given error returned when
-// creating a batch spec and ascertains whether it's a licensing error. If it
-// is, then a better message is output. Regardless, the return value of this
-// function should be used to replace the original error passed in to ensure
-// that the displayed output is sensible.
-func prettyPrintBatchUnlicensedError(out *output.Output, err error) error {
-	// Pull apart the error to see if it's a licensing error: if so, we should
-	// display a friendlier and more actionable message than the usual GraphQL
-	// error output.
-	if gerrs, ok := err.(api.GraphQlErrors); ok {
-		// A licensing error should be the sole error returned, so we'll only
-		// pretty print if there's one error.
-		if len(gerrs) == 1 {
-			if code, cerr := gerrs[0].Code(); cerr != nil {
-				// We got a malformed value in the error extensions; at this
-				// point, there's not much sensible we can do. Let's log this in
-				// verbose mode, but let the original error bubble up rather
-				// than this one.
-				out.Verbosef("Unexpected error parsing the GraphQL error: %v", cerr)
-			} else if code == "ErrCampaignsUnlicensed" || code == "ErrBatchChangesUnlicensed" {
-				// OK, let's print a better message, then return an
-				// exitCodeError to suppress the normal automatic error block.
-				// Note that we have hand wrapped the output at 80 (printable)
-				// characters: having automatic wrapping some day would be nice,
-				// but this should be sufficient for now.
-				block := out.Block(output.Line("🪙", output.StyleWarning, "Batch Changes is a paid feature of Sourcegraph. All users can create sample"))
-				block.WriteLine(output.Linef("", output.StyleWarning, "batch changes with up to 5 changesets without a license. Contact Sourcegraph"))
-				block.WriteLine(output.Linef("", output.StyleWarning, "sales at %shttps://about.sourcegraph.com/contact/sales/%s to obtain a trial", output.StyleSearchLink, output.StyleWarning))
-				block.WriteLine(output.Linef("", output.StyleWarning, "license."))
-				block.Write("")
-				block.WriteLine(output.Linef("", output.StyleWarning, "To proceed with this batch change, you will need to create 5 or fewer"))
-				block.WriteLine(output.Linef("", output.StyleWarning, "changesets. To do so, you could try adding %scount:5%s to your", output.StyleSearchAlertProposedQuery, output.StyleWarning))
-				block.WriteLine(output.Linef("", output.StyleWarning, "%srepositoriesMatchingQuery%s search, or reduce the number of changesets in", output.StyleReset, output.StyleWarning))
-				block.WriteLine(output.Linef("", output.StyleWarning, "%simportChangesets%s.", output.StyleReset, output.StyleWarning))
-				block.Close()
-				return &exitCodeError{exitCode: graphqlErrorsExitCode}
-			}
-		}
-	}
-
-	// In all other cases, we'll just return the original error.
-	return err
+	return workingDirectory, nil
 }
 
 func checkExecutable(cmd string, args ...string) error {
 	if err := exec.Command(cmd, args...).Run(); err != nil {
 		return fmt.Errorf(
-			"failed to execute \"%s %s\":\n\t%s\n\n'src batch' require %q to be available.",
+			"failed to execute \"%s %s\":\n\t%s\n\n'src batch' requires %q to be available.",
 			cmd,
 			strings.Join(args, " "),
 			err,
@@ -619,4 +650,19 @@ func contextCancelOnInterrupt(parent context.Context) (context.Context, func()) 
 		signal.Stop(c)
 		ctxCancel()
 	}
+}
+
+func getBatchParallelism(ctx context.Context, flag int) (int, error) {
+	if flag > 0 {
+		return flag, nil
+	}
+
+	return docker.NCPU(ctx)
+}
+
+func validateSourcegraphVersionConstraint(ffs *batches.FeatureFlags) error {
+	if ffs.Sourcegraph40 {
+		return nil
+	}
+	return errors.Newf("\n\n * Warning:\n This version of src-cli requires Sourcegraph version 4.0 or newer. If you're not on Sourcegraph 4.0 or newer, please use the 3.x release of src-cli that corresponds to your Sourcegraph version.\n\n")
 }

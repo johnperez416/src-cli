@@ -4,12 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	cliLog "log"
 
-	"github.com/pkg/errors"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 	"github.com/sourcegraph/sourcegraph/lib/output"
+
 	"github.com/sourcegraph/src-cli/internal/api"
+	"github.com/sourcegraph/src-cli/internal/batches"
 	"github.com/sourcegraph/src-cli/internal/batches/graphql"
 	"github.com/sourcegraph/src-cli/internal/batches/service"
+	"github.com/sourcegraph/src-cli/internal/batches/ui"
 )
 
 func init() {
@@ -19,9 +23,11 @@ apply to.
 
 Usage:
 
-    src batch repositories -f FILE
+    src batch repositories [-f] FILE
 
 Examples:
+
+    $ src batch repositories batch.spec.yaml
 
     $ src batch repositories -f batch.spec.yaml
 
@@ -30,8 +36,26 @@ Examples:
 	flagSet := flag.NewFlagSet("repositories", flag.ExitOnError)
 
 	var (
-		fileFlag = flagSet.String("f", "", "The batch spec file to read.")
+		fileFlag = flagSet.String("f", "", "The batch spec file to read, or - to read from standard input.")
 		apiFlags = api.NewFlags(flagSet)
+	)
+
+	var (
+		allowUnsupported bool
+		allowIgnored     bool
+		skipErrors       bool
+	)
+	flagSet.BoolVar(
+		&allowUnsupported, "allow-unsupported", false,
+		"Allow unsupported code hosts.",
+	)
+	flagSet.BoolVar(
+		&allowIgnored, "force-override-ignore", false,
+		"Do not ignore repositories that have a .batchignore file.",
+	)
+	flagSet.BoolVar(
+		&skipErrors, "skip-errors", false,
+		"If true, errors encountered won't stop the program, but only log them.",
 	)
 
 	handler := func(args []string) error {
@@ -39,18 +63,36 @@ Examples:
 			return err
 		}
 
-		ctx := context.Background()
-		client := cfg.apiClient(apiFlags, flagSet.Output())
-
-		svc := service.New(&service.Opts{Client: client})
-
-		if err := svc.DetermineFeatureFlags(ctx); err != nil {
+		file, err := getBatchSpecFile(flagSet, fileFlag)
+		if err != nil {
 			return err
 		}
 
-		out := output.NewOutput(flagSet.Output(), output.OutputOpts{Verbose: *verbose})
-		spec, _, err := batchParseSpec(out, fileFlag, svc)
+		ctx := context.Background()
+		client := cfg.apiClient(apiFlags, flagSet.Output())
+
+		svc := service.New(&service.Opts{
+			Client: client,
+		})
+
+		_, ffs, err := svc.DetermineLicenseAndFeatureFlags(ctx, skipErrors)
 		if err != nil {
+			return err
+		}
+
+		if err := validateSourcegraphVersionConstraint(ffs); err != nil {
+			if !skipErrors {
+				return err
+			} else {
+				cliLog.Printf("WARNING: %s", err)
+			}
+		}
+
+		out := output.NewOutput(flagSet.Output(), output.OutputOpts{Verbose: *verbose})
+		spec, _, _, err := parseBatchSpec(ctx, file, svc)
+		if err != nil {
+			ui := &ui.TUI{Out: out}
+			ui.ParsingBatchSpecFailure(err)
 			return err
 		}
 
@@ -64,44 +106,38 @@ Examples:
 			return err
 		}
 
-		seen := map[string]struct{}{}
-		final := []*graphql.Repository{}
-		finalMax := 0
-		for _, on := range spec.On {
-			repos, err := svc.ResolveRepositoriesOn(ctx, &on)
-			if err != nil {
-				return errors.Wrapf(err, "Resolving %q", on.String())
-			}
-
-			max := 0
-			for _, repo := range repos {
-				if len(repo.Name) > max {
-					max = len(repo.Name)
-				}
-
-				if _, ok := seen[repo.ID]; !ok {
-					seen[repo.ID] = struct{}{}
-					final = append(final, repo)
-				}
-			}
-
-			if max > finalMax {
-				finalMax = max
-			}
-
-			if err := execTemplate(queryTmpl, batchRepositoryTemplateInput{
-				Max:                 max,
-				Query:               on.String(),
-				RepoCount:           len(repos),
-				Repos:               repos,
-				SourcegraphEndpoint: cfg.Endpoint,
-			}); err != nil {
-				return err
+		_, repos, err := svc.ResolveWorkspacesForBatchSpec(ctx, spec, allowUnsupported, allowIgnored)
+		if err != nil {
+			if _, ok := err.(batches.UnsupportedRepoSet); ok {
+				// This is fine, we just ignore those in the output.
+			} else if _, ok := err.(batches.IgnoredRepoSet); ok {
+				// This is fine, we just ignore those in the output.
+			} else {
+				return errors.Wrap(err, "resolving repositories")
 			}
 		}
 
+		repoCount := 0
+		max := 0
+		for _, repo := range repos {
+			if len(repo.Name) > max {
+				max = len(repo.Name)
+			}
+
+			repoCount++
+		}
+
+		if err := execTemplate(queryTmpl, batchRepositoryTemplateInput{
+			Max:                 max,
+			RepoCount:           len(repos),
+			Repos:               repos,
+			SourcegraphEndpoint: cfg.Endpoint,
+		}); err != nil {
+			return err
+		}
+
 		return execTemplate(totalTmpl, batchRepositoryTemplateInput{
-			RepoCount: len(final),
+			RepoCount: repoCount,
 		})
 	}
 
@@ -118,21 +154,9 @@ Examples:
 }
 
 const batchRepositoriesTemplate = `
-{{- color "logo" -}}✱{{- color "nc" -}}
-{{- " " -}}
-{{- if eq .RepoCount 0 -}}
-    {{- color "warning" -}}
-{{- else -}}
-    {{- color "success" -}}
-{{- end -}}
-{{- .RepoCount }} repositor{{ if eq .RepoCount 1 }}y{{else}}ies{{ end }}{{- color "nc" -}}
-{{- if ne (len .Query) 0 -}}
-    {{- " for " -}}{{- color "search-query"}}"{{.Query}}"{{ color "nc" -}}
-{{- end -}}
-{{- "\n" -}}
-
 {{- range .Repos -}}
     {{- "  "}}{{ color "success" }}{{ padRight .Name $.Max " " }}{{ color "nc" -}}
+    {{- if ne (len .Branch.Name) 0 -}}{{ " " }}{{- color "search-branch" -}}{{- .Branch.Name -}}{{ color "nc" -}}{{- end -}}
     {{- color "search-border"}}{{" ("}}{{color "nc" -}}
     {{- color "search-repository"}}{{$.SourcegraphEndpoint}}{{.URL}}{{color "nc" -}}
     {{- color "search-border"}}{{")\n"}}{{color "nc" -}}
@@ -147,7 +171,7 @@ const batchRepositoriesTotalTemplate = `
 {{- else -}}
     {{- color "success" -}}
 {{- end -}}
-{{- .RepoCount }} repositor{{ if eq .RepoCount 1 }}y{{else}}ies{{ end }} total
+{{- .RepoCount }} workspace{{ if ne .RepoCount 1 }}s{{ end }} total
 {{- color "nc" -}}
 `
 

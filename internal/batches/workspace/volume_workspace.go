@@ -6,38 +6,51 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/sourcegraph/sourcegraph/lib/errors"
 
-	"github.com/sourcegraph/src-cli/internal/batches"
+	batcheslib "github.com/sourcegraph/sourcegraph/lib/batches"
+
 	"github.com/sourcegraph/src-cli/internal/batches/docker"
-	"github.com/sourcegraph/src-cli/internal/batches/git"
 	"github.com/sourcegraph/src-cli/internal/batches/graphql"
+	"github.com/sourcegraph/src-cli/internal/batches/repozip"
 	"github.com/sourcegraph/src-cli/internal/exec"
 	"github.com/sourcegraph/src-cli/internal/version"
 )
 
-type dockerVolumeWorkspaceCreator struct{ tempDir string }
+type imageEnsurer func(ctx context.Context, image string) (docker.Image, error)
+
+type dockerVolumeWorkspaceCreator struct {
+	tempDir     string
+	EnsureImage imageEnsurer
+}
 
 var _ Creator = &dockerVolumeWorkspaceCreator{}
 
-func (wc *dockerVolumeWorkspaceCreator) Type() CreatorType { return CreatorTypeVolume }
-
-func (wc *dockerVolumeWorkspaceCreator) Create(ctx context.Context, repo *graphql.Repository, steps []batches.Step, archive batches.RepoZip) (Workspace, error) {
+func (wc *dockerVolumeWorkspaceCreator) Create(ctx context.Context, repo *graphql.Repository,
+	steps []batcheslib.Step, archive repozip.Archive) (ws Workspace, err error) {
 	volume, err := wc.createVolume(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating Docker volume")
 	}
 
+	defer func() {
+		if err != nil {
+			deleteVolume(ctx, volume)
+		}
+	}()
+
 	// Figure out the user that containers will be run as.
 	ug := docker.UIDGID{}
 	if len(steps) > 0 {
-		var err error
-		if ug, err = steps[0].ImageUIDGID(ctx); err != nil {
+		img, err := wc.EnsureImage(ctx, steps[0].Container)
+		if err != nil {
+			return nil, err
+		}
+		if ug, err = img.UIDGID(ctx); err != nil {
 			return nil, errors.Wrap(err, "getting container UID and GID")
 		}
 	}
@@ -65,6 +78,10 @@ func (*dockerVolumeWorkspaceCreator) createVolume(ctx context.Context) (string, 
 	}
 
 	return string(bytes.TrimSpace(out)), nil
+}
+
+func deleteVolume(ctx context.Context, volume string) error {
+	return exec.CommandContext(ctx, "docker", "volume", "rm", volume).Run()
 }
 
 func (*dockerVolumeWorkspaceCreator) prepareGitRepo(ctx context.Context, w *dockerVolumeWorkspace) error {
@@ -212,7 +229,7 @@ var _ Workspace = &dockerVolumeWorkspace{}
 
 func (w *dockerVolumeWorkspace) Close(ctx context.Context) error {
 	// Cleanup here is easy: we just get rid of the Docker volume.
-	return exec.CommandContext(ctx, "docker", "volume", "rm", w.volume).Run()
+	return deleteVolume(ctx, w.volume)
 }
 
 func (w *dockerVolumeWorkspace) DockerRunOpts(ctx context.Context, target string) ([]string, error) {
@@ -220,29 +237,6 @@ func (w *dockerVolumeWorkspace) DockerRunOpts(ctx context.Context, target string
 }
 
 func (w *dockerVolumeWorkspace) WorkDir() *string { return nil }
-
-func (w *dockerVolumeWorkspace) Changes(ctx context.Context) (*git.Changes, error) {
-	script := `#!/bin/sh
-
-set -e
-# No set -x here, since we're going to parse the git status output.
-
-git add --all > /dev/null
-exec git status --porcelain
-`
-
-	out, err := w.runScript(ctx, "/work", script)
-	if err != nil {
-		return nil, errors.Wrap(err, "running git status")
-	}
-
-	changes, err := git.ParseGitStatus(out)
-	if err != nil {
-		return nil, errors.Wrapf(err, "parsing git status output:\n\n%s", string(out))
-	}
-
-	return &changes, nil
-}
 
 func (w *dockerVolumeWorkspace) Diff(ctx context.Context) ([]byte, error) {
 	// As of Sourcegraph 3.14 we only support unified diff format.
@@ -254,7 +248,11 @@ func (w *dockerVolumeWorkspace) Diff(ctx context.Context) ([]byte, error) {
 	// ATTENTION: When you change the options here, be sure to also update the
 	// ApplyDiff method accordingly.
 	script := `#!/bin/sh
-	
+
+set -e
+# No set -x here, since we're going to parse the git status output.
+
+git add --all > /dev/null
 exec git diff --cached --no-prefix --binary
 `
 
@@ -268,6 +266,8 @@ exec git diff --cached --no-prefix --binary
 
 func (w *dockerVolumeWorkspace) ApplyDiff(ctx context.Context, diff []byte) error {
 	script := fmt.Sprintf(`#!/bin/sh
+
+set -e
 
 cat <<'EOF' | exec git apply -p0 -
 %s
@@ -302,7 +302,7 @@ func init() {
 // container started from the dockerWorkspaceImage, then run it and return the
 // output.
 func (w *dockerVolumeWorkspace) runScript(ctx context.Context, target, script string) ([]byte, error) {
-	f, err := ioutil.TempFile(w.tempDir, "src-run-*")
+	f, err := os.CreateTemp(w.tempDir, "src-run-*")
 	if err != nil {
 		return nil, errors.Wrap(err, "creating run script")
 	}
@@ -312,11 +312,15 @@ func (w *dockerVolumeWorkspace) runScript(ctx context.Context, target, script st
 	if _, err := f.WriteString(script); err != nil {
 		return nil, errors.Wrap(err, "writing run script")
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return nil, errors.Wrap(err, "closing run script")
+	}
 
 	// Sidestep any umask issues on the temporary file by always making it
 	// executable by everyone.
-	os.Chmod(name, 0755)
+	if err := os.Chmod(name, 0755); err != nil {
+		return nil, errors.Wrap(err, "chmodding run script")
+	}
 
 	common, err := w.DockerRunOpts(ctx, target)
 	if err != nil {

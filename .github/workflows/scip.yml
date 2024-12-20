@@ -1,0 +1,34 @@
+name: SCIP
+on:
+  workflow_dispatch:
+  push:
+env:
+  GOPRIVATE: "github.com/sourcegraph/*"
+  PRIVATE_TOKEN: "${{ secrets.PRIVATE_SG_ACCESS_TOKEN }}"
+jobs:
+  scip-go:
+    runs-on: ubuntu-latest
+    container: sourcegraph/scip-go
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get src-cli
+        run: curl -L https://sourcegraph.com/.api/src-cli/src_linux_amd64 -o /usr/local/bin/src;
+          chmod +x /usr/local/bin/src
+      - name: Set directory to safe for git
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+      - name: Enable pulling Go modules from private sourcegraph/sourcegraph
+        run: git config --global url."https://${PRIVATE_TOKEN}@github.com/sourcegraph/".insteadOf "https://github.com/sourcegraph/"
+      - name: Generate SCIP data
+        run: scip-go
+
+      - name: Upload SCIP to Cloud
+        run: src code-intel upload -github-token='${{ secrets.GITHUB_TOKEN }}' -no-progress
+        env:
+          SRC_ENDPOINT: https://sourcegraph.com/
+          SRC_ACCESS_TOKEN: ${{ secrets.SRC_ACCESS_TOKEN_DOTCOM }}
+
+      - name: Upload SCIP to S2
+        run: src code-intel upload -github-token='${{ secrets.GITHUB_TOKEN }}' -no-progress
+        env:
+          SRC_ENDPOINT: https://sourcegraph.sourcegraph.com/
+          SRC_ACCESS_TOKEN: ${{ secrets.SRC_ACCESS_TOKEN_S2 }}

@@ -2,7 +2,7 @@ package servegit
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +19,7 @@ import (
 
 const testAddress = "test.local:3939"
 
-var discardLogger = log.New(ioutil.Discard, "", log.LstdFlags)
+var discardLogger = log.New(io.Discard, "", log.LstdFlags)
 
 func TestReposHandler(t *testing.T) {
 	cases := []struct {
@@ -32,7 +32,7 @@ func TestReposHandler(t *testing.T) {
 		repos: []string{"project1", "project2"},
 	}, {
 		name:  "nested",
-		repos: []string{"project1", "project1/subproject", "project2", "dir/project3"},
+		repos: []string{"project1", "project2", "dir/project3", "dir/project4.bare"},
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,69 +47,14 @@ func TestReposHandler(t *testing.T) {
 
 			var want []Repo
 			for _, name := range tc.repos {
-				want = append(want, Repo{Name: name, URI: path.Join("/repos", name)})
-			}
-			testReposHandler(t, h, want)
-		})
-
-		// Now do the same test, but we root it under a repo we serve. This is
-		// to test we properly serve up the root repo as something other than
-		// "."
-		t.Run("rooted-"+tc.name, func(t *testing.T) {
-			repos := []string{"project-root"}
-			for _, name := range tc.repos {
-				repos = append(repos, filepath.Join("project-root", name))
-			}
-
-			root := gitInitRepos(t, repos...)
-
-			// This is the difference to above, we point our root at the git repo
-			root = filepath.Join(root, "project-root")
-
-			h := (&Serve{
-				Info:  testLogger(t),
-				Debug: discardLogger,
-				Addr:  testAddress,
-				Root:  root,
-			}).handler()
-
-			// project-root is served from /repos, etc
-			want := []Repo{{Name: "project-root", URI: "/repos"}}
-			for _, name := range tc.repos {
-				want = append(want, Repo{Name: path.Join("project-root", name), URI: path.Join("/repos", name)})
-			}
-			testReposHandler(t, h, want)
-		})
-
-		// Ensure everything still works if root is a symlink
-		t.Run("rooted-"+tc.name, func(t *testing.T) {
-			root := gitInitRepos(t, tc.repos...)
-
-			// This is the difference, we create a symlink for root
-			{
-				tmp, err := ioutil.TempDir("", "")
-				if err != nil {
-					t.Fatal(err)
+				isBare := strings.HasSuffix(name, ".bare")
+				uri := path.Join("/repos", name)
+				clonePath := uri
+				if !isBare {
+					clonePath += "/.git"
 				}
-				t.Cleanup(func() { os.RemoveAll(tmp) })
+				want = append(want, Repo{Name: name, URI: uri, ClonePath: clonePath})
 
-				symlink := filepath.Join(tmp, "symlink-root")
-				if err := os.Symlink(root, symlink); err != nil {
-					t.Fatal(err)
-				}
-				root = symlink
-			}
-
-			h := (&Serve{
-				Info:  testLogger(t),
-				Debug: discardLogger,
-				Addr:  testAddress,
-				Root:  root,
-			}).handler()
-
-			var want []Repo
-			for _, name := range tc.repos {
-				want = append(want, Repo{Name: name, URI: path.Join("/repos", name)})
 			}
 			testReposHandler(t, h, want)
 		})
@@ -125,7 +70,7 @@ func testReposHandler(t *testing.T, h http.Handler, repos []Repo) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		b, err := ioutil.ReadAll(res.Body)
+		b, err := io.ReadAll(res.Body)
 		res.Body.Close()
 		if err != nil {
 			t.Fatal(err)
@@ -171,12 +116,22 @@ func testReposHandler(t *testing.T, h http.Handler, repos []Repo) {
 	}
 }
 
-func gitInitRepos(t *testing.T, names ...string) string {
-	root, err := ioutil.TempDir("", "")
-	if err != nil {
+func gitInitBare(t *testing.T, path string) {
+	if err := exec.Command("git", "init", "--bare", path).Run(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(root) })
+}
+
+func gitInit(t *testing.T, path string) {
+	cmd := exec.Command("git", "init")
+	cmd.Dir = path
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func gitInitRepos(t *testing.T, names ...string) string {
+	root := t.TempDir()
 	root = filepath.Join(root, "repos-root")
 
 	for _, name := range names {
@@ -184,9 +139,11 @@ func gitInitRepos(t *testing.T, names ...string) string {
 		if err := os.MkdirAll(p, 0755); err != nil {
 			t.Fatal(err)
 		}
-		p = filepath.Join(p, ".git")
-		if err := exec.Command("git", "init", "--bare", p).Run(); err != nil {
-			t.Fatal(err)
+
+		if strings.HasSuffix(p, ".bare") {
+			gitInitBare(t, p)
+		} else {
+			gitInit(t, p)
 		}
 	}
 
@@ -194,17 +151,13 @@ func gitInitRepos(t *testing.T, names ...string) string {
 }
 
 func TestIgnoreGitSubmodules(t *testing.T) {
-	root, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(root) })
+	root := t.TempDir()
 
 	if err := os.MkdirAll(filepath.Join(root, "dir"), os.ModePerm); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := ioutil.WriteFile(filepath.Join(root, "dir", ".git"), []byte("ignore me please"), os.ModePerm); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "dir", ".git"), []byte("ignore me please"), os.ModePerm); err != nil {
 		t.Fatal(err)
 	}
 
@@ -218,6 +171,24 @@ func TestIgnoreGitSubmodules(t *testing.T) {
 	}
 	if len(repos) != 0 {
 		t.Fatalf("expected no repos, got %v", repos)
+	}
+}
+
+func TestIsBareRepo(t *testing.T) {
+	dir := t.TempDir()
+
+	gitInitBare(t, dir)
+
+	if !isBareRepo(dir) {
+		t.Errorf("Path %s it not a bare repository", dir)
+	}
+}
+
+func TestEmptyDirIsNotBareRepo(t *testing.T) {
+	dir := t.TempDir()
+
+	if isBareRepo(dir) {
+		t.Errorf("Path %s it falsey detected as a bare repository", dir)
 	}
 }
 
