@@ -1,12 +1,16 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
+
+	"github.com/sourcegraph/sourcegraph/lib/errors"
+
+	"github.com/sourcegraph/src-cli/internal/cmderrors"
 )
 
 // command is a subcommand handler and its flag set.
@@ -20,8 +24,8 @@ type command struct {
 	// handler is the function that is invoked to handle this command.
 	handler func(args []string) error
 
-	// flagSet.Usage function to invoke on e.g. -h flag. If nil, a default one
-	// one is used.
+	// flagSet.Usage function to invoke on e.g. -h flag. If nil, a default one is
+	// used.
 	usageFunc func()
 }
 
@@ -45,7 +49,7 @@ type commander []*command
 func (c commander) run(flagSet *flag.FlagSet, cmdName, usageText string, args []string) {
 	// Parse flags.
 	flagSet.Usage = func() {
-		fmt.Fprint(flag.CommandLine.Output(), usageText)
+		_, _ = fmt.Fprint(flag.CommandLine.Output(), usageText)
 	}
 	if !flagSet.Parsed() {
 		_ = flagSet.Parse(args)
@@ -53,6 +57,7 @@ func (c commander) run(flagSet *flag.FlagSet, cmdName, usageText string, args []
 
 	// Print usage if the command is "help".
 	if flagSet.Arg(0) == "help" || flagSet.NArg() == 0 {
+		flagSet.SetOutput(os.Stdout)
 		flagSet.Usage()
 		os.Exit(0)
 	}
@@ -65,7 +70,7 @@ func (c commander) run(flagSet *flag.FlagSet, cmdName, usageText string, args []
 			continue
 		}
 		cmd.flagSet.Usage = func() {
-			fmt.Fprintf(flag.CommandLine.Output(), "Usage of '%s %s':\n", cmdName, cmd.flagSet.Name())
+			_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage of '%s %s':\n", cmdName, cmd.flagSet.Name())
 			cmd.flagSet.PrintDefaults()
 		}
 	}
@@ -84,24 +89,37 @@ func (c commander) run(flagSet *flag.FlagSet, cmdName, usageText string, args []
 			log.Fatal("reading config: ", err)
 		}
 
+		// Print help to stdout if requested
+		if slices.IndexFunc(args, func(s string) bool {
+			return s == "--help"
+		}) >= 0 {
+			cmd.flagSet.SetOutput(os.Stdout)
+			flag.CommandLine.SetOutput(os.Stdout)
+			cmd.flagSet.Usage()
+			os.Exit(0)
+		}
+
 		// Parse subcommand flags.
 		args := flagSet.Args()[1:]
 		if err := cmd.flagSet.Parse(args); err != nil {
+			fmt.Printf("Error parsing subcommand flags: %s\n", err)
 			panic(fmt.Sprintf("all registered commands should use flag.ExitOnError: error: %s", err))
 		}
 
 		// Execute the subcommand.
 		if err := cmd.handler(flagSet.Args()[1:]); err != nil {
-			if _, ok := err.(*usageError); ok {
+			if _, ok := err.(*cmderrors.UsageError); ok {
 				log.Printf("error: %s\n\n", err)
+				cmd.flagSet.SetOutput(os.Stderr)
+				flag.CommandLine.SetOutput(os.Stderr)
 				cmd.flagSet.Usage()
 				os.Exit(2)
 			}
-			if e, ok := err.(*exitCodeError); ok {
-				if e.error != nil {
-					log.Println(e.error)
+			if e, ok := err.(*cmderrors.ExitCodeError); ok {
+				if e.HasError() {
+					log.Println(e)
 				}
-				os.Exit(e.exitCode)
+				os.Exit(e.Code())
 			}
 			log.Fatal(err)
 		}
@@ -110,30 +128,6 @@ func (c commander) run(flagSet *flag.FlagSet, cmdName, usageText string, args []
 	log.Printf("%s: unknown subcommand %q", cmdName, name)
 	log.Fatalf("Run '%s help' for usage.", cmdName)
 }
-
-// usageError is an error type that subcommands can return in order to signal
-// that a usage error has occurred.
-type usageError struct {
-	error
-}
-
-// exitCodeError is an error type that subcommands can return in order to
-// specify the exact exit code.
-type exitCodeError struct {
-	error
-	exitCode int
-}
-
-func (e *exitCodeError) Error() string {
-	if e.error != nil {
-		return fmt.Sprintf("%s (exit code: %d)", e.error, e.exitCode)
-	}
-	return fmt.Sprintf("exit code: %d", e.exitCode)
-}
-
-const (
-	graphqlErrorsExitCode = 2
-)
 
 func didYouMeanOtherCommand(actual string, suggested []string) *command {
 	fullSuggestions := make([]string, len(suggested))

@@ -7,20 +7,17 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
+
+	"github.com/grafana/regexp"
 
 	"github.com/sourcegraph/src-cli/internal/api"
 	"github.com/sourcegraph/src-cli/internal/streaming"
 )
 
-var labelRegexp *regexp.Regexp
-
-func init() {
-	labelRegexp, _ = regexp.Compile("(?:\\[)(.*?)(?:])")
-}
+var labelRegexp = regexp.MustCompile(`(?:\[)(.*?)(?:])`)
 
 func streamSearch(query string, opts streaming.Opts, client api.Client, w io.Writer) error {
 	var d streaming.Decoder
@@ -106,7 +103,6 @@ func textDecoder(query string, t *template.Template, w io.Writer) streaming.Deco
 			if err != nil {
 				logError(fmt.Sprintf("error when executing template: %s\n", err))
 			}
-			return
 		},
 		OnError: func(eventError *streaming.EventError) {
 			fmt.Printf("ERR: %s", eventError.Message)
@@ -133,13 +129,26 @@ func textDecoder(query string, t *template.Template, w io.Writer) streaming.Deco
 		OnMatches: func(matches []streaming.EventMatch) {
 			for _, match := range matches {
 				switch match := match.(type) {
-				case *streaming.EventFileMatch:
-					err := t.ExecuteTemplate(w, "file", struct {
+				case *streaming.EventContentMatch:
+					err := t.ExecuteTemplate(w, "content", struct {
 						Query string
-						*streaming.EventFileMatch
+						*streaming.EventContentMatch
+					}{
+						Query:             query,
+						EventContentMatch: match,
+					},
+					)
+					if err != nil {
+						logError(fmt.Sprintf("error when executing template: %s\n", err))
+						return
+					}
+				case *streaming.EventPathMatch:
+					err := t.ExecuteTemplate(w, "path", struct {
+						Query string
+						*streaming.EventPathMatch
 					}{
 						Query:          query,
-						EventFileMatch: match,
+						EventPathMatch: match,
 					},
 					)
 					if err != nil {
@@ -201,25 +210,32 @@ func isLimitHit(progress *streaming.Progress) bool {
 }
 
 const streamingTemplate = `
-{{define "file"}}
+{{define "path"}}
 	{{- /* Repository and file name */ -}}
 	{{- color "search-repository"}}{{.Repository}}{{color "nc" -}}
 	{{- " › " -}}
 	{{- color "search-filename"}}{{.Path}}{{color "nc" -}}
-	{{- color "success"}}{{matchOrMatches (len .LineMatches)}}{{color "nc" -}}
+	{{- color "success"}}{{matchOrMatches 0}}{{color "nc" -}}
 	{{- "\n" -}}
 	{{- color "search-border"}}{{"--------------------------------------------------------------------------------\n"}}{{color "nc"}}
-	
-	{{- /* Line matches */ -}}
-	{{- $lineMatches := .LineMatches -}}
-	{{- range $index, $match := $lineMatches -}}
-		{{- if not (streamSearchSequentialLineNumber $lineMatches $index) -}}
-			{{- color "search-border"}}{{"  ------------------------------------------------------------------------------\n"}}{{color "nc"}}
-		{{- end -}}
-		{{- "  "}}{{color "search-line-numbers"}}{{pad (addInt32 $match.LineNumber 1) 6 " "}}{{color "nc" -}}
-		{{- color "search-border"}}{{" |  "}}{{color "nc"}}{{streamSearchHighlightMatch $.Query $match }}
-	{{- end -}}
 	{{- "\n" -}}
+{{- end -}}
+
+{{define "content"}}
+	{{- /* Repository and file name */ -}}
+	{{- color "search-repository"}}{{.Repository}}{{color "nc" -}}
+	{{- " › " -}}
+	{{- color "search-filename"}}{{.Path}}{{color "nc" -}}
+	{{- color "success"}}{{matchOrMatches (countMatches .ChunkMatches)}}{{color "nc" -}}
+	{{- "\n" -}}
+	{{- color "search-border"}}{{"--------------------------------------------------------------------------------\n"}}{{color "nc"}}
+
+	{{- /* Content matches */ -}}
+	{{- $chunks := .ChunkMatches -}}
+	{{- range $index, $chunk := $chunks -}}
+		{{streamSearchHighlightMatch $chunk }}
+                {{- color "search-border"}}{{"\n  ------------------------------------------------------------------------------\n"}}{{color "nc"}}
+	{{- end -}}
 {{- end -}}
 
 {{define "symbol"}}
@@ -230,7 +246,7 @@ const streamingTemplate = `
 	{{- color "success"}}{{matchOrMatches (len .Symbols)}}{{color "nc" -}}
 	{{- "\n" -}}
 	{{- color "search-border"}}{{"--------------------------------------------------------------------------------\n"}}{{color "nc"}}
-	
+
 	{{- /* Symbols */ -}}
 	{{- $symbols := .Symbols -}}
 	{{- range $index, $match := $symbols -}}
@@ -258,7 +274,7 @@ const streamingTemplate = `
 	{{- color "search-link"}}{{$.SourcegraphEndpoint}}{{.URL}}{{color "nc" -}}
 	{{- color "search-border"}}{{")\n"}}{{color "nc" -}}
 	{{- color "nc" -}}
-	
+
 	{{- /* Repository > author name "commit subject" (time ago) */ -}}
 	{{- color "search-commit-subject"}}{{(streamSearchRenderCommitLabel .Label)}}{{color "nc" -}}
 	{{- color "success" -}}
@@ -301,25 +317,52 @@ const streamingTemplate = `
 `
 
 var streamSearchTemplateFuncs = map[string]interface{}{
-	"streamSearchHighlightMatch": func(query string, match streaming.EventLineMatch) string {
-		var highlights []highlight
-		if strings.Contains(query, "patterntype:structural") {
-			highlights = streamConvertMatchToHighlights(match, false)
-			return applyHighlightsForFile(match.Line, highlights)
+	"streamSearchHighlightMatch": func(match streaming.ChunkMatch) string {
+		var result []rune
+
+		addLineColumn := func(n int) []rune {
+			result = append(result, []rune("  ")...)
+			result = append(result, []rune(ansiColors["search-line-numbers"])...)
+			result = append(result, []rune(fmt.Sprintf("% 6d", match.ContentStart.Line+1+n))...)
+			result = append(result, []rune(ansiColors["nc"])...)
+			result = append(result, []rune(ansiColors["search-border"])...)
+			result = append(result, []rune(" |  ")...)
+			result = append(result, []rune(ansiColors["nc"])...)
+			return result
 		}
 
-		highlights = streamConvertMatchToHighlights(match, true)
-		return applyHighlights(match.Line, highlights, ansiColors["search-match"], ansiColors["nc"])
-	},
+		// if there are overlapping ranges, use this value to know
+		// whether to terminate highlighting or not.
+		highlightingActive := 0
 
-	"streamSearchSequentialLineNumber": func(lineMatches []streaming.EventLineMatch, index int) bool {
-		prevIndex := index - 1
-		if prevIndex < 0 {
-			return true
+		lineCount := 0
+		addLineColumn(lineCount)
+		for offset, r := range match.Content {
+			offset++
+			if r == '\n' {
+				lineCount++
+				result = append(result, []rune(ansiColors["nc"])...)
+				result = append(result, r)
+				addLineColumn(lineCount)
+				result = append(result, []rune(ansiColors["search-match"])...)
+				continue
+			}
+			for _, rr := range match.Ranges {
+				if rr.Start.Offset-match.ContentStart.Offset+1 == offset {
+					result = append(result, []rune(ansiColors["search-match"])...)
+					highlightingActive++
+				} else if rr.End.Offset-match.ContentStart.Offset+1 == offset {
+					highlightingActive--
+					if highlightingActive <= 0 {
+						result = append(result, []rune(ansiColors["nc"])...)
+					}
+				}
+			}
+			result = append(result, r)
+
 		}
-		prevLineNumber := lineMatches[prevIndex].LineNumber
-		lineNumber := lineMatches[index].LineNumber
-		return prevLineNumber == lineNumber-1
+		result = append(result, []rune(ansiColors["nc"])...)
+		return string(result)
 	},
 
 	"streamSearchHighlightCommit": func(content string, ranges [][3]int32) string {
@@ -350,6 +393,14 @@ var streamSearchTemplateFuncs = map[string]interface{}{
 			return " (1 match)"
 		}
 		return fmt.Sprintf(" (%d matches)", i)
+	},
+
+	"countMatches": func(chunks []streaming.ChunkMatch) int {
+		count := 0
+		for _, c := range chunks {
+			count += len(c.Ranges)
+		}
+		return count
 	},
 }
 
@@ -402,11 +453,11 @@ func streamSearchHighlightDiffPreview(diffPreview string, highlights []highlight
 		}
 
 		// Replace our start-of-match token with the color we wish.
-		line = strings.Replace(line, uniqueStartOfMatchToken, ansiColors["search-match"], -1)
+		line = strings.ReplaceAll(line, uniqueStartOfMatchToken, ansiColors["search-match"])
 
 		// Replace our end-of-match token with the color terminator,
 		// and start all colors that were previously started to the left.
-		line = strings.Replace(line, uniqueEndOfMatchToken, ansiColors["nc"]+strings.Join(left, ""), -1)
+		line = strings.ReplaceAll(line, uniqueEndOfMatchToken, ansiColors["nc"]+strings.Join(left, ""))
 
 		final = append(final, line)
 	}
@@ -414,32 +465,11 @@ func streamSearchHighlightDiffPreview(diffPreview string, highlights []highlight
 }
 
 func stripMarkdownMarkers(content string) string {
-	content = strings.TrimLeft(content, "```COMMIT_EDITMSG\n")
-	content = strings.TrimLeft(content, "```diff\n")
-	return strings.TrimRight(content, "\n```")
-}
-
-// convertMatchToHighlights converts a FileMatch m to a highlight data type.
-// When isPreview is true, it is assumed that the result to highlight is only on
-// one line, and the offsets are relative to this line. When isPreview is false,
-// the lineNumber from the FileMatch data is used, which is relative to the file
-// content.
-func streamConvertMatchToHighlights(m streaming.EventLineMatch, isPreview bool) (highlights []highlight) {
-	var line int
-	for _, offsetAndLength := range m.OffsetAndLengths {
-		ol := offsetAndLength
-		offset := int(ol[0])
-		length := int(ol[1])
-		if isPreview {
-			line = 1
-		} else {
-			line = int(m.LineNumber)
-		}
-		highlights = append(highlights, highlight{line: line, character: offset, length: length})
-	}
-	return highlights
+	content = strings.TrimPrefix(content, "```COMMIT_EDITMSG\n")
+	content = strings.TrimPrefix(content, "```diff\n")
+	return strings.TrimSuffix(content, "\n```")
 }
 
 func logError(msg string) {
-	_, _ = fmt.Fprintf(os.Stderr, msg)
+	_, _ = fmt.Fprint(os.Stderr, msg)
 }

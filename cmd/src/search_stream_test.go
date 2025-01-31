@@ -2,14 +2,14 @@ package main
 
 import (
 	"flag"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/hexops/autogold"
 
 	"github.com/sourcegraph/src-cli/internal/api"
 	"github.com/sourcegraph/src-cli/internal/streaming"
@@ -37,17 +37,38 @@ func testServer(t *testing.T, handler http.Handler) *httptest.Server {
 }
 
 var event = []streaming.EventMatch{
-	&streaming.EventFileMatch{
-		Type:       streaming.FileMatchType,
+	&streaming.EventContentMatch{
+		Type:       streaming.ContentMatchType,
 		Path:       "path/to/file",
 		Repository: "org/repo",
 		Branches:   nil,
-		Version:    "",
-		LineMatches: []streaming.EventLineMatch{
+		Commit:     "",
+		ChunkMatches: []streaming.ChunkMatch{
 			{
-				Line:             "foo bar",
-				LineNumber:       4,
-				OffsetAndLengths: [][2]int32{{4, 3}},
+				Content:      "foo bar foo",
+				ContentStart: streaming.Location{Line: 4},
+				Ranges: []streaming.Range{
+					{
+						Start: streaming.Location{Offset: 0},
+						End:   streaming.Location{Offset: 3},
+					},
+					{
+						Start: streaming.Location{Offset: 0},
+						End:   streaming.Location{Offset: 3},
+					},
+					{
+						Start: streaming.Location{Offset: 1},
+						End:   streaming.Location{Offset: 2},
+					},
+					{
+						Start: streaming.Location{Offset: 1},
+						End:   streaming.Location{Offset: 3},
+					},
+					{
+						Start: streaming.Location{Offset: 8},
+						End:   streaming.Location{Offset: 11},
+					},
+				},
 			},
 		},
 	},
@@ -61,7 +82,7 @@ var event = []streaming.EventMatch{
 		Path:       "path/to/file",
 		Repository: "org/repo",
 		Branches:   []string{},
-		Version:    "",
+		Commit:     "",
 		Symbols: []streaming.Symbol{
 			{
 				URL:           "github.com/sourcegraph/sourcegraph/-/blob/cmd/frontend/graphqlbackend/search_results.go#L1591:26-1591:35",
@@ -113,19 +134,16 @@ func TestSearchStream(t *testing.T) {
 	cases := []struct {
 		name string
 		opts streaming.Opts
-		want string
 	}{
 		{
 			"Text",
 			streaming.Opts{},
-			"./testdata/streaming_search_want.txt",
 		},
 		{
 			"JSON",
 			streaming.Opts{
 				Json: true,
 			},
-			"./testdata/streaming_search_want.json",
 		},
 	}
 	for _, c := range cases {
@@ -147,17 +165,12 @@ func TestSearchStream(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := ioutil.ReadAll(r)
+			got, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatal(err)
 			}
-			want, err := ioutil.ReadFile(c.want)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if d := cmp.Diff(want, got); d != "" {
-				t.Fatalf("(-want +got): %s", d)
-			}
+
+			autogold.Equal(t, autogold.Raw(got))
 		})
 	}
 

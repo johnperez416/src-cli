@@ -2,11 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 
-	"github.com/sourcegraph/sourcegraph/lib/output"
+	"github.com/sourcegraph/src-cli/internal/cmderrors"
 )
 
 func init() {
@@ -16,13 +15,16 @@ creating or updating the described batch change if necessary.
 
 Usage:
 
-    src batch apply -f FILE [command options]
+    src batch apply [command options] [-f FILE]
+    src batch apply [command options] FILE
 
 Examples:
 
     $ src batch apply -f batch.spec.yaml
-  
+
     $ src batch apply -f batch.spec.yaml -namespace myorg
+
+    $ src batch apply batch.spec.yaml
 
 `
 
@@ -34,26 +36,22 @@ Examples:
 			return err
 		}
 
-		if len(flagSet.Args()) != 0 {
-			return &usageError{errors.New("additional arguments not allowed")}
+		file, err := getBatchSpecFile(flagSet, &flags.file)
+		if err != nil {
+			return err
 		}
-
-		out := output.NewOutput(flagSet.Output(), output.OutputOpts{Verbose: *verbose})
 
 		ctx, cancel := contextCancelOnInterrupt(context.Background())
 		defer cancel()
 
-		err := executeBatchSpec(ctx, executeBatchSpecOpts{
+		if err = executeBatchSpec(ctx, executeBatchSpecOpts{
 			flags:  flags,
-			out:    out,
 			client: cfg.apiClient(flags.api, flagSet.Output()),
+			file:   file,
 
 			applyBatchSpec: true,
-		})
-		if err != nil {
-			printExecutionError(out, err)
-			out.Write("")
-			return &exitCodeError{nil, 1}
+		}); err != nil {
+			return cmderrors.ExitCode(1, nil)
 		}
 
 		return nil

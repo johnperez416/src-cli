@@ -3,8 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
-	"regexp"
 	"strconv"
+
+	"github.com/grafana/regexp"
 
 	"github.com/mattn/go-isatty"
 )
@@ -21,7 +22,14 @@ func bg256Color(code int) string {
 
 // See https://i.stack.imgur.com/KTSQa.png or https://jonasjacek.github.io/colors/
 var ansiColors = map[string]string{
-	"nc":      "\033[0m",
+	// Simple colors.
+	"blue":   "\033[34m",
+	"green":  "\033[32m",
+	"yellow": "\033[33m",
+	"red":    "\033[31m",
+	"nc":     "\033[0m", // reset
+
+	// Custom colors.
 	"logo":    fg256Color(57),
 	"warning": fg256Color(124),
 	"success": fg256Color(2),
@@ -31,6 +39,7 @@ var ansiColors = map[string]string{
 	"search-border":         fg256Color(239),
 	"search-link":           fg256Color(237),
 	"search-repository":     fg256Color(23),
+	"search-branch":         fg256Color(0) + bg256Color(7),
 	"search-filename":       fg256Color(69),
 	"search-match":          fg256Color(0) + bg256Color(11),
 	"search-line-numbers":   fg256Color(69),

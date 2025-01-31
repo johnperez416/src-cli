@@ -1,0 +1,26 @@
+{
+  "name": "@sourcegraph/src",
+  "version": "0.0.0-dev",
+  "description": "Sourcegraph CLI",
+  "repository": "git@github.com:sourcegraph/src-cli.git",
+  "author": "Code Intelligence at Sourcegraph",
+  "license": "Apache-2.0",
+  "scripts": {
+    "install": "node install.js",
+    "prepack": "node copy-files.js"
+  },
+  "main": "src.js",
+  "bin": {
+    "src": "src.js"
+  },
+  "keywords": [
+    "sourcegraph"
+  ],
+  "dependencies": {
+    "tar": "^7.1.0"
+  },
+  "devDependencies": {
+    "@types/tar": "6.1.13"
+  },
+  "private": false
+}
